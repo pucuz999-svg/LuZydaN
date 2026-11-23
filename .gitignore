@@ -16,4 +16,4 @@
 local.properties
 .env
 debug.keystore
-data/
+/data/

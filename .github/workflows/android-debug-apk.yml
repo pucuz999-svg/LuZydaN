@@ -65,11 +65,20 @@ jobs:
 
       - name: Compile Debug APK
         run: |
+          set -o pipefail
+          GRADLE_ARGS=":app:assembleDebug --no-daemon --no-configuration-cache --stacktrace -Dkotlin.compiler.execution.strategy=daemon -Pkotlin.compiler.execution.strategy=daemon"
           if [ -x ./gradlew ]; then
-            ./gradlew :app:assembleDebug --no-daemon --stacktrace
+            ./gradlew $GRADLE_ARGS 2>&1 | tee gradle-build.log
           else
-            gradle :app:assembleDebug --no-daemon --stacktrace
+            gradle $GRADLE_ARGS 2>&1 | tee gradle-build.log
           fi
+
+      - name: Upload Gradle build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-log
+          path: gradle-build.log
 
       - name: Verify APK output
         run: |

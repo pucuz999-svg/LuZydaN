@@ -19,7 +19,7 @@ import { LoginView } from './components/LoginView';
 import { PerformanceBoosterView } from './components/PerformanceBoosterView';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { SavedProfilesView } from './components/SavedProfilesView';
-import { DEVICE_CATALOG, PLAYSTYLE_META } from './data/devices';
+import { DEVICE_CATALOG, PLAYSTYLE_META } from './utils/devices';
 import {
   AuthUser,
   DeviceSpec,

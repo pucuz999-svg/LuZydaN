@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Copy, Info, Plus, RotateCcw, Save, Search, X } from 'lucide-react';
-import { PLAYSTYLE_META } from '../data/devices';
+import { PLAYSTYLE_META } from '../utils/devices';
 import {
   CalibrationOutput,
   DeviceSpec,
