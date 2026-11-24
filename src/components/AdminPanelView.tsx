@@ -24,6 +24,7 @@ import {
 interface AdminPanelViewProps {
   token: string;
   currentAdminId: string;
+  currentUserId: string;
   devices: DeviceSpec[];
   onAdminCredentialsUpdated: (token: string, user: AuthUser) => void;
   onResetAdminClaim: () => void;
@@ -32,10 +33,12 @@ interface AdminPanelViewProps {
 export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   token,
   currentAdminId,
+  currentUserId,
   devices,
   onAdminCredentialsUpdated,
   onResetAdminClaim,
 }) => {
+  const [envOverrideActive, setEnvOverrideActive] = useState(false);
   const [customers, setCustomers] = useState<CustomerAccount[]>([]);
   const [admins, setAdmins] = useState<AdminAccount[]>([]);
   const [requests, setRequests] = useState<CustomerRequest[]>([]);
@@ -82,7 +85,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     setLoading(true);
     setError(null);
     try {
-      const [custRes, reqRes, admRes] = await Promise.all([
+      const [custRes, reqRes, admRes, statusRes] = await Promise.all([
         fetch('/api/admin/customers', {
           headers: { Authorization: `Bearer ${token}` },
         }),
@@ -92,11 +95,16 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         fetch('/api/admin/admins', {
           headers: { Authorization: `Bearer ${token}` },
         }),
+        fetch('/api/auth/status'),
       ]);
 
       const custData = await custRes.json();
       const reqData = await reqRes.json();
       const admData = await admRes.json();
+      if (statusRes.ok) {
+        const statusData = await statusRes.json();
+        setEnvOverrideActive(Boolean(statusData?.envOverrideActive));
+      }
 
       if (!custRes.ok) {
         setError(custData?.error || 'Could not load customer accounts.');
@@ -997,11 +1005,13 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               </h2>
             </div>
             <p className="mt-1 text-xs text-slate-400">
-              Update your claimed Admin ID and password, or reset back to First-Run Setup.
+              {envOverrideActive && currentUserId === 'admin-root'
+                ? 'Root admin credentials are currently controlled by ADMIN_ID / ADMIN_PASSCODE in Settings → Secrets. Create a named Admin ID above to manage a separate password in the dashboard.'
+                : 'Update your Admin ID and password, or reset back to First-Run Setup.'}
             </p>
           </div>
 
-          {!confirmResetClaim ? (
+          {!(envOverrideActive && currentUserId === 'admin-root') && (!confirmResetClaim ? (
             <button
               type="button"
               onClick={() => {
@@ -1056,7 +1066,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
                 Cancel
               </button>
             </div>
-          )}
+          ))}
         </div>
 
         {adminSuccess && (
@@ -1065,6 +1075,11 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
           </div>
         )}
 
+        {envOverrideActive && currentUserId === 'admin-root' ? (
+          <div className="mt-4 rounded-lg border border-slate-800 bg-[#0B0E14] px-4 py-3 text-xs text-slate-400">
+            To change the root secret password, edit <span className="font-mono text-slate-200">ADMIN_ID</span> / <span className="font-mono text-slate-200">ADMIN_PASSCODE</span> in Settings → Secrets, or add a named Full-Access Admin ID in the section above.
+          </div>
+        ) : (
         <form
           onSubmit={async (e) => {
             e.preventDefault();
@@ -1181,6 +1196,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
             </button>
           </div>
         </form>
+        )}
       </section>
     </div>
   );

@@ -237,13 +237,68 @@ function getEnvAdminConfig(): { adminId: string; passcode: string } | null {
   return { adminId, passcode };
 }
 
+const SESSION_COOKIE_NAME = 'firetune_session';
+
+function parseCookieValue(cookieHeader: string | undefined, name: string): string | null {
+  if (!cookieHeader) return null;
+  const parts = cookieHeader.split(';');
+  for (const part of parts) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = part.slice(0, eqIdx).trim();
+    if (key === name) {
+      return decodeURIComponent(part.slice(eqIdx + 1).trim());
+    }
+  }
+  return null;
+}
+
+function isSecureRequest(req: Request): boolean {
+  if (req.secure) return true;
+  const proto = req.headers['x-forwarded-proto'];
+  if (typeof proto === 'string') {
+    return proto.split(',')[0].trim() === 'https';
+  }
+  return false;
+}
+
+function setSessionCookie(req: Request, res: Response, token: string): void {
+  const secure = isSecureRequest(req);
+  const attrs = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
+    secure ? 'SameSite=None' : 'SameSite=Lax',
+    ...(secure ? ['Secure'] : []),
+  ];
+  res.setHeader('Set-Cookie', attrs.join('; '));
+}
+
+function clearSessionCookie(req: Request, res: Response): void {
+  const secure = isSecureRequest(req);
+  const attrs = [
+    `${SESSION_COOKIE_NAME}=`,
+    'Path=/',
+    'HttpOnly',
+    'Max-Age=0',
+    secure ? 'SameSite=None' : 'SameSite=Lax',
+    ...(secure ? ['Secure'] : []),
+  ];
+  res.setHeader('Set-Cookie', attrs.join('; '));
+}
+
 function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   const header = req.headers.authorization || '';
-  if (!header.startsWith('Bearer ')) {
+  const bearerToken = header.startsWith('Bearer ')
+    ? header.slice('Bearer '.length).trim()
+    : '';
+  const cookieToken = parseCookieValue(req.headers.cookie, SESSION_COOKIE_NAME) || '';
+  const token = bearerToken || cookieToken;
+  if (!token) {
     res.status(401).json({ error: 'Authentication required' });
     return;
   }
-  const token = header.slice('Bearer '.length).trim();
   const payload = verifySessionToken(token);
   if (!payload) {
     res.status(401).json({ error: 'Session expired or invalid' });
@@ -324,6 +379,7 @@ async function startServer() {
       displayName: 'Administrator',
     });
 
+    setSessionCookie(req, res, token);
     res.status(201).json({
       token,
       user: {
@@ -366,6 +422,7 @@ async function startServer() {
           customId: envAdmin.adminId,
           displayName: 'Administrator',
         });
+        setSessionCookie(req, res, token);
         res.json({
           token,
           user: {
@@ -401,6 +458,7 @@ async function startServer() {
           customId: namedAdmin.customId,
           displayName: namedAdmin.displayName,
         });
+        setSessionCookie(req, res, token);
         res.json({
           token,
           user: {
@@ -432,6 +490,7 @@ async function startServer() {
           displayName: 'Administrator',
         });
 
+        setSessionCookie(req, res, token);
         res.json({
           token,
           user: {
@@ -506,6 +565,7 @@ async function startServer() {
       assignedDeviceId: customer.assignedDeviceId,
     });
 
+    setSessionCookie(req, res, token);
     res.json({
       token,
       user: {
@@ -591,10 +651,19 @@ async function startServer() {
     });
   });
 
-  // Verify active Bearer session
+  // Verify active Bearer or HttpOnly cookie session
   app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
     const u = req.authUser!;
+    const freshToken = signSessionToken({
+      sub: u.sub,
+      role: u.role,
+      customId: u.customId,
+      displayName: u.displayName,
+      assignedDeviceId: u.assignedDeviceId,
+    });
+    setSessionCookie(req, res, freshToken);
     res.json({
+      token: freshToken,
       user: {
         id: u.sub,
         role: u.role,
@@ -603,6 +672,63 @@ async function startServer() {
         assignedDeviceId: u.assignedDeviceId,
       },
     });
+  });
+
+  // Non-erroring session check for page reload / PWA launch (returns 200 even when signed out)
+  app.get('/api/auth/session', (req, res) => {
+    const header = req.headers.authorization || '';
+    const bearerToken = header.startsWith('Bearer ')
+      ? header.slice('Bearer '.length).trim()
+      : '';
+    const cookieToken = parseCookieValue(req.headers.cookie, SESSION_COOKIE_NAME) || '';
+    const token = bearerToken || cookieToken;
+    const payload = token ? verifySessionToken(token) : null;
+    if (!payload) {
+      res.json({ authenticated: false, token: null, user: null });
+      return;
+    }
+
+    const store = ensureStore();
+    if (payload.role === 'customer') {
+      const c = store.customers.find((item) => item.id === payload.sub);
+      if (!c || !c.active) {
+        clearSessionCookie(req, res);
+        res.json({ authenticated: false, token: null, user: null });
+        return;
+      }
+    } else if (payload.sub !== 'admin-root') {
+      const a = store.admins.find((item) => item.id === payload.sub);
+      if (!a || !a.active) {
+        clearSessionCookie(req, res);
+        res.json({ authenticated: false, token: null, user: null });
+        return;
+      }
+    }
+
+    const freshToken = signSessionToken({
+      sub: payload.sub,
+      role: payload.role,
+      customId: payload.customId,
+      displayName: payload.displayName,
+      assignedDeviceId: payload.assignedDeviceId,
+    });
+    setSessionCookie(req, res, freshToken);
+    res.json({
+      authenticated: true,
+      token: freshToken,
+      user: {
+        id: payload.sub,
+        role: payload.role,
+        customId: payload.customId,
+        displayName: payload.displayName,
+        assignedDeviceId: payload.assignedDeviceId,
+      },
+    });
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    clearSessionCookie(req, res);
+    res.json({ loggedOut: true });
   });
 
   // Admin-only: List Customer Requests
@@ -983,6 +1109,7 @@ async function startServer() {
           displayName: target.displayName,
         });
 
+        setSessionCookie(req, res, token);
         res.json({
           token,
           user: {
@@ -1028,6 +1155,7 @@ async function startServer() {
         displayName: 'Administrator',
       });
 
+      setSessionCookie(req, res, token);
       res.json({
         token,
         user: {
@@ -1069,6 +1197,7 @@ async function startServer() {
 
       store.adminClaim = null;
       saveStore(store);
+      clearSessionCookie(req, res);
       res.json({ reset: true });
     }
   );

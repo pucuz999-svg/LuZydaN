@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bookmark,
   Crosshair,
@@ -65,9 +65,10 @@ const BASE_NAV_ITEMS: {
 ];
 
 export default function App() {
-  // Bearer session held strictly in React/JS memory (not localStorage/sessionStorage)
+  // Bearer session held strictly in React/JS memory (backed by HttpOnly session cookie across reloads)
   const [authToken, setAuthToken] = useState<string | null>(null);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authChecking, setAuthChecking] = useState(true);
 
   const [activeTab, setActiveTab] = useState<ActiveTab>('sensitivity');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -75,6 +76,10 @@ export default function App() {
   const [launchModalOpen, setLaunchModalOpen] = useState(false);
   const [appliedStepsCount, setAppliedStepsCount] = useState(0);
   const [autoCopied, setAutoCopied] = useState(false);
+  const pendingProfileOverrideRef = useRef<{
+    sensitivity: SensitivityValues;
+    fireButtonSize: number;
+  } | null>(null);
 
   // Persisted custom devices
   const [customDevices, setCustomDevices] = useState<DeviceSpec[]>(() => {
@@ -146,11 +151,55 @@ export default function App() {
     calibration.fireButtonSize
   );
 
-  // Sync slider overrides when device/playstyle/grip/range changes
+  // Sync slider overrides when device/playstyle/grip/range changes (unless loading a saved preset)
   useEffect(() => {
+    if (pendingProfileOverrideRef.current) {
+      const pending = pendingProfileOverrideRef.current;
+      pendingProfileOverrideRef.current = null;
+      setSensitivityOverrides(pending.sensitivity);
+      setFireButtonOverride(pending.fireButtonSize);
+      return;
+    }
     setSensitivityOverrides(calibration.sensitivity);
     setFireButtonOverride(calibration.fireButtonSize);
   }, [calibration]);
+
+  // Restore session from HttpOnly cookie on page reload or PWA relaunch
+  useEffect(() => {
+    let active = true;
+    const restoreSession = async () => {
+      try {
+        const res = await fetch('/api/auth/session', { credentials: 'same-origin' });
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json') && active) {
+          const data = (await res.json()) as {
+            authenticated?: boolean;
+            token?: string | null;
+            user?: AuthUser | null;
+          };
+          if (data.authenticated && data.token && data.user) {
+            setAuthToken(data.token);
+            setAuthUser(data.user);
+            if (
+              data.user.assignedDeviceId &&
+              allDevices.some((d) => d.id === data.user?.assignedDeviceId)
+            ) {
+              setSelectedDeviceId(data.user.assignedDeviceId);
+            }
+            setActiveTab(data.user.role === 'admin' ? 'admin' : 'sensitivity');
+          }
+        }
+      } catch {
+        // Ignore unauthenticated startup
+      } finally {
+        if (active) setAuthChecking(false);
+      }
+    };
+    restoreSession();
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     try {
@@ -219,17 +268,27 @@ export default function App() {
 
   const handleLoadProfile = (profile: SavedProfile) => {
     const exists = allDevices.some((d) => d.id === profile.deviceId);
-    if (exists) {
-      setSelectedDeviceId(profile.deviceId);
-    }
-    setPlaystyle(profile.playstyle);
-    setGrip(profile.grip);
-    setRangeBias(profile.rangeBias);
-    // Apply exact saved values after calibration effect runs
-    setTimeout(() => {
+    const sameContext =
+      (!exists || profile.deviceId === selectedDeviceId) &&
+      profile.playstyle === playstyle &&
+      profile.grip === grip &&
+      profile.rangeBias === rangeBias;
+
+    if (sameContext) {
       setSensitivityOverrides(profile.sensitivity);
       setFireButtonOverride(profile.fireButtonSize);
-    }, 0);
+    } else {
+      pendingProfileOverrideRef.current = {
+        sensitivity: profile.sensitivity,
+        fireButtonSize: profile.fireButtonSize,
+      };
+      if (exists) {
+        setSelectedDeviceId(profile.deviceId);
+      }
+      setPlaystyle(profile.playstyle);
+      setGrip(profile.grip);
+      setRangeBias(profile.rangeBias);
+    }
     setActiveTab('sensitivity');
   };
 
@@ -267,7 +326,12 @@ export default function App() {
     setActiveTab(user.role === 'admin' ? 'admin' : 'sensitivity');
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+    } catch {
+      // Ignore network errors on logout
+    }
     setAuthToken(null);
     setAuthUser(null);
     setActiveTab('sensitivity');
@@ -328,6 +392,19 @@ export default function App() {
     setAutoCopied(copiedOk);
     setLaunchModalOpen(true);
   };
+
+  if (authChecking) {
+    return (
+      <div className="min-h-screen bg-[#0B0E14] text-slate-100 flex items-center justify-center px-4">
+        <div className="text-center">
+          <h1 className="text-2xl font-bold tracking-tight text-white">
+            Fire<span className="text-orange-500">Tune</span>
+          </h1>
+          <p className="mt-2 text-xs text-slate-400">Loading workspace...</p>
+        </div>
+      </div>
+    );
+  }
 
   if (!authUser || !authToken) {
     return <LoginView devices={allDevices} onLoginSuccess={handleLoginSuccess} />;
@@ -600,6 +677,7 @@ export default function App() {
             <AdminPanelView
               token={authToken}
               currentAdminId={authUser.customId}
+              currentUserId={authUser.id}
               devices={allDevices}
               onAdminCredentialsUpdated={(nextToken, nextUser) => {
                 setAuthToken(nextToken);
