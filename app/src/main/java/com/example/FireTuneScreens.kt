@@ -87,7 +87,10 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -1975,8 +1978,13 @@ fun BrandLogoMark(large: Boolean = false) {
 fun AuthGateScreen(
   devices: List<DeviceSpec>,
   adminConfigured: Boolean,
-  onUserLogin: (identifier: String, password: String) -> String?,
-  onRequestLogin: (
+  serverSyncEnabled: Boolean,
+  serverUrl: String,
+  serverConnected: Boolean,
+  serverStatusError: String?,
+  onSaveServerSettings: suspend (enabled: Boolean, url: String) -> String?,
+  onUserLogin: suspend (identifier: String, password: String) -> String?,
+  onRequestLogin: suspend (
     email: String,
     customId: String,
     displayName: String,
@@ -1984,9 +1992,10 @@ fun AuthGateScreen(
     deviceId: String,
     note: String,
   ) -> Pair<String?, String?>,
-  onAdminClaim: (adminId: String, password: String) -> String?,
-  onAdminLogin: (adminId: String, password: String) -> String?,
+  onAdminClaim: suspend (adminId: String, password: String) -> String?,
+  onAdminLogin: suspend (adminId: String, password: String) -> String?,
 ) {
+  val scope = rememberCoroutineScope()
   var tab by remember { mutableStateOf(AuthTabMode.USER) }
   var email by remember { mutableStateOf("") }
   var customId by remember { mutableStateOf("") }
@@ -1997,8 +2006,14 @@ fun AuthGateScreen(
   var note by remember { mutableStateOf("") }
   var showPassword by remember { mutableStateOf(false) }
   var showDevicePicker by remember { mutableStateOf(false) }
+  var submitting by remember { mutableStateOf(false) }
   var errorMsg by remember { mutableStateOf<String?>(null) }
   var statusMsg by remember { mutableStateOf<String?>(null) }
+
+  var showServerConfig by remember { mutableStateOf(false) }
+  var serverUrlInput by remember(serverUrl) { mutableStateOf(serverUrl) }
+  var syncToggleInput by remember(serverSyncEnabled) { mutableStateOf(serverSyncEnabled) }
+  var testingServer by remember { mutableStateOf(false) }
 
   val isFirstRunAdminClaim = tab == AuthTabMode.ADMIN && !adminConfigured
   val selectedDeviceObj = remember(devices, selectedDeviceId) {
@@ -2290,41 +2305,50 @@ fun AuthGateScreen(
 
       Spacer(Modifier.height(14.dp))
       Button(
+        enabled = !submitting,
         onClick = {
+          if (submitting) return@Button
           errorMsg = null
           statusMsg = null
-          when {
-            tab == AuthTabMode.REQUEST -> {
-              val (err, ok) = onRequestLogin(
-                email.trim(),
-                customId.trim(),
-                displayName.trim(),
-                password,
-                selectedDeviceId,
-                note.trim(),
-              )
-              if (err != null) {
-                errorMsg = err
-              } else {
-                statusMsg = ok
-                customId = email.trim().lowercase()
-                password = ""
-                note = ""
-                tab = AuthTabMode.USER
+          scope.launch {
+            submitting = true
+            try {
+              when {
+                tab == AuthTabMode.REQUEST -> {
+                  val (err, ok) = onRequestLogin(
+                    email.trim(),
+                    customId.trim(),
+                    displayName.trim(),
+                    password,
+                    selectedDeviceId,
+                    note.trim(),
+                  )
+                  if (err != null) {
+                    errorMsg = err
+                  } else {
+                    statusMsg = ok
+                    customId = email.trim().lowercase()
+                    password = ""
+                    note = ""
+                    tab = AuthTabMode.USER
+                  }
+                }
+                isFirstRunAdminClaim -> {
+                  if (password != confirmPassword) {
+                    errorMsg = "Passwords do not match."
+                  } else {
+                    errorMsg = onAdminClaim(customId.trim(), password)
+                  }
+                }
+                tab == AuthTabMode.ADMIN -> {
+                  errorMsg = onAdminLogin(customId.trim(), password)
+                }
+                else -> {
+                  errorMsg = onUserLogin(customId.trim(), password)
+                }
               }
-            }
-            isFirstRunAdminClaim -> {
-              if (password != confirmPassword) {
-                errorMsg = "Passwords do not match."
-              } else {
-                errorMsg = onAdminClaim(customId.trim(), password)
-              }
-            }
-            tab == AuthTabMode.ADMIN -> {
-              errorMsg = onAdminLogin(customId.trim(), password)
-            }
-            else -> {
-              errorMsg = onUserLogin(customId.trim(), password)
+            } finally {
+              submitting = false
             }
           }
         },
@@ -2339,6 +2363,7 @@ fun AuthGateScreen(
         Spacer(Modifier.width(6.dp))
         Text(
           when {
+            submitting -> "Processing..."
             isFirstRunAdminClaim -> "Claim Admin & Sign In"
             tab == AuthTabMode.REQUEST -> "Submit Mail ID Request"
             tab == AuthTabMode.ADMIN -> "Sign In as Admin"
@@ -2362,6 +2387,112 @@ fun AuthGateScreen(
             "First time? Switch to Admin Login to set up Admin & approve requests",
             color = OrangeSoft,
             fontSize = 11.sp,
+          )
+        }
+      }
+
+      Spacer(Modifier.height(10.dp))
+      HorizontalDivider(color = BorderSlate.copy(alpha = 0.6f))
+      Spacer(Modifier.height(8.dp))
+
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+      ) {
+        Column(modifier = Modifier.weight(1f)) {
+          Text(
+            text = when {
+              !serverSyncEnabled -> "Mode: Local Offline Device"
+              serverConnected -> "Server Sync: Connected"
+              else -> "Server Sync: Unreachable"
+            },
+            color = when {
+              !serverSyncEnabled -> TextMuted
+              serverConnected -> EmeraldAccent
+              else -> AmberAccent
+            },
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+          )
+          if (serverSyncEnabled && !serverConnected && !serverStatusError.isNullOrBlank()) {
+            Text(
+              text = serverStatusError,
+              color = RoseAccent,
+              fontSize = 10.sp,
+              lineHeight = 14.sp,
+            )
+          }
+        }
+        TextButton(
+          onClick = { showServerConfig = !showServerConfig },
+          contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+        ) {
+          Text(
+            if (showServerConfig) "Hide" else "Server URL",
+            color = OrangeSoft,
+            fontSize = 11.sp,
+          )
+        }
+      }
+
+      if (showServerConfig) {
+        Spacer(Modifier.height(8.dp))
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.SpaceBetween,
+          verticalAlignment = Alignment.CenterVertically,
+        ) {
+          Text("Sync with FF TUNE Server", color = TextPrimary, fontSize = 12.sp)
+          Switch(
+            checked = syncToggleInput,
+            onCheckedChange = { syncToggleInput = it },
+            colors = SwitchDefaults.colors(checkedThumbColor = BgObsidian, checkedTrackColor = OrangeAccent),
+          )
+        }
+        if (syncToggleInput) {
+          Spacer(Modifier.height(6.dp))
+          OutlinedTextField(
+            value = serverUrlInput,
+            onValueChange = { serverUrlInput = it },
+            label = { Text("Server URL", fontSize = 11.sp) },
+            placeholder = { Text("https://...", fontSize = 11.sp) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+          )
+        }
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+          enabled = !testingServer,
+          onClick = {
+            errorMsg = null
+            statusMsg = null
+            scope.launch {
+              testingServer = true
+              try {
+                val err = onSaveServerSettings(syncToggleInput, serverUrlInput.trim())
+                if (err != null) {
+                  errorMsg = err
+                } else {
+                  statusMsg = if (syncToggleInput) {
+                    "Connected to FF TUNE server."
+                  } else {
+                    "Switched to Local Offline Mode."
+                  }
+                  showServerConfig = false
+                }
+              } finally {
+                testingServer = false
+              }
+            }
+          },
+          modifier = Modifier.fillMaxWidth(),
+          border = BorderStroke(1.dp, OrangeAccent.copy(alpha = 0.6f)),
+        ) {
+          Text(
+            if (testingServer) "Checking..." else "Save & Test Connection",
+            color = OrangeSoft,
+            fontSize = 12.sp,
           )
         }
       }
@@ -2450,9 +2581,11 @@ fun AdminAccessScreen(
   users: List<LocalAuthUser>,
   currentAdminId: String,
   isRootAdmin: Boolean,
-  onApproveRequest: (String) -> Unit,
-  onRejectRequest: (String) -> Unit,
-  onCreateUser: (
+  serverSyncEnabled: Boolean,
+  onRefreshData: suspend () -> String?,
+  onApproveRequest: suspend (String) -> String?,
+  onRejectRequest: suspend (String) -> String?,
+  onCreateUser: suspend (
     email: String,
     customId: String,
     displayName: String,
@@ -2460,16 +2593,17 @@ fun AdminAccessScreen(
     deviceId: String,
     role: AuthRole,
   ) -> Pair<String?, String?>,
-  onToggleSuspend: (String) -> Unit,
-  onDeleteUser: (String) -> Unit,
-  onUpdateAdminCredentials: (
+  onToggleSuspend: suspend (String) -> String?,
+  onDeleteUser: suspend (String) -> String?,
+  onUpdateAdminCredentials: suspend (
     currentPassword: String,
     newAdminId: String,
     newPassword: String,
   ) -> Pair<String?, String?>,
-  onResetAdminClaim: (currentPassword: String) -> String?,
+  onResetAdminClaim: suspend (currentPassword: String) -> String?,
   onOpenCalibrationStudio: () -> Unit,
 ) {
+  val scope = rememberCoroutineScope()
   var email by remember { mutableStateOf("") }
   var customId by remember { mutableStateOf("") }
   var displayName by remember { mutableStateOf("") }
@@ -2478,6 +2612,8 @@ fun AdminAccessScreen(
   var selectedRole by remember { mutableStateOf(AuthRole.USER) }
   var showDevicePicker by remember { mutableStateOf(false) }
   var formMsg by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
+  var requestActionError by remember { mutableStateOf<String?>(null) }
+  var refreshing by remember { mutableStateOf(false) }
 
   var adminCurrentPass by remember { mutableStateOf("") }
   var newAdminIdInput by remember(currentAdminId) { mutableStateOf(currentAdminId) }
@@ -2485,6 +2621,22 @@ fun AdminAccessScreen(
   var confirmAdminPass by remember { mutableStateOf("") }
   var confirmResetClaim by remember { mutableStateOf(false) }
   var adminCredsMsg by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
+
+  LaunchedEffect(serverSyncEnabled) {
+    val err = onRefreshData()
+    if (err != null) requestActionError = err
+    if (serverSyncEnabled) {
+      while (true) {
+        delay(8000L)
+        val pollErr = onRefreshData()
+        if (pollErr != null) {
+          requestActionError = pollErr
+        } else {
+          requestActionError = null
+        }
+      }
+    }
+  }
 
   val pendingCount = requests.count { it.status == RequestStatus.PENDING }
   val assignedDevice = remember(devices, assignedDeviceId) {
@@ -2525,8 +2677,48 @@ fun AdminAccessScreen(
 
     // Pending & Recent Mail ID Requests
     PanelCard {
-      Text("Mail ID Login Requests ($pendingCount Pending)", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-      Spacer(Modifier.height(8.dp))
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+      ) {
+        Text("Mail ID Login Requests ($pendingCount Pending)", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+        IconButton(
+          enabled = !refreshing,
+          onClick = {
+            scope.launch {
+              refreshing = true
+              try {
+                requestActionError = onRefreshData()
+              } finally {
+                refreshing = false
+              }
+            }
+          },
+        ) {
+          Icon(
+            Icons.Rounded.Refresh,
+            contentDescription = "Refresh requests",
+            tint = if (refreshing) OrangeAccent else TextMuted,
+          )
+        }
+      }
+      if (requestActionError != null) {
+        Surface(
+          modifier = Modifier.fillMaxWidth(),
+          color = RoseAccent.copy(alpha = 0.14f),
+          shape = RoundedCornerShape(8.dp),
+        ) {
+          Text(
+            requestActionError ?: "",
+            color = RoseAccent,
+            fontSize = 11.sp,
+            modifier = Modifier.padding(8.dp),
+          )
+        }
+        Spacer(Modifier.height(6.dp))
+      }
+      Spacer(Modifier.height(6.dp))
       if (requests.isEmpty()) {
         Text("No login requests yet.", color = TextMuted, fontSize = 12.sp)
       } else {
@@ -2561,7 +2753,11 @@ fun AdminAccessScreen(
               Spacer(Modifier.height(8.dp))
               Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
-                  onClick = { onApproveRequest(req.id) },
+                  onClick = {
+                    scope.launch {
+                      requestActionError = onApproveRequest(req.id)
+                    }
+                  },
                   modifier = Modifier.weight(1f),
                   colors = ButtonDefaults.buttonColors(containerColor = EmeraldAccent, contentColor = BgObsidian),
                 ) {
@@ -2570,7 +2766,11 @@ fun AdminAccessScreen(
                   Text("Grant Access", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 }
                 OutlinedButton(
-                  onClick = { onRejectRequest(req.id) },
+                  onClick = {
+                    scope.launch {
+                      requestActionError = onRejectRequest(req.id)
+                    }
+                  },
                   modifier = Modifier.weight(1f),
                   border = BorderStroke(1.dp, RoseAccent.copy(alpha = 0.6f)),
                 ) {
@@ -2666,22 +2866,24 @@ fun AdminAccessScreen(
       Spacer(Modifier.height(10.dp))
       Button(
         onClick = {
-          val (err, ok) = onCreateUser(
-            email.trim(),
-            customId.trim(),
-            displayName.trim(),
-            password,
-            assignedDeviceId,
-            selectedRole,
-          )
-          if (err != null) {
-            formMsg = false to err
-          } else {
-            formMsg = true to (ok ?: "Account created")
-            email = ""
-            customId = ""
-            displayName = ""
-            password = ""
+          scope.launch {
+            val (err, ok) = onCreateUser(
+              email.trim(),
+              customId.trim(),
+              displayName.trim(),
+              password,
+              assignedDeviceId,
+              selectedRole,
+            )
+            if (err != null) {
+              formMsg = false to err
+            } else {
+              formMsg = true to (ok ?: "Account created")
+              email = ""
+              customId = ""
+              displayName = ""
+              password = ""
+            }
           }
         },
         modifier = Modifier.fillMaxWidth(),
@@ -2721,14 +2923,14 @@ fun AdminAccessScreen(
               )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
-              TextButton(onClick = { onToggleSuspend(user.id) }) {
+              TextButton(onClick = { scope.launch { formMsg = onToggleSuspend(user.id)?.let { false to it } } }) {
                 Text(
                   if (user.suspended) "Activate" else "Suspend",
                   color = if (user.suspended) EmeraldAccent else AmberAccent,
                   fontSize = 11.sp,
                 )
               }
-              IconButton(onClick = { onDeleteUser(user.id) }) {
+              IconButton(onClick = { scope.launch { formMsg = onDeleteUser(user.id)?.let { false to it } } }) {
                 Icon(Icons.Rounded.Delete, contentDescription = "Delete", tint = RoseAccent, modifier = Modifier.size(18.dp))
               }
             }
@@ -2806,14 +3008,16 @@ fun AdminAccessScreen(
           if (newAdminPass != confirmAdminPass) {
             adminCredsMsg = false to "New admin passwords do not match."
           } else {
-            val (err, ok) = onUpdateAdminCredentials(adminCurrentPass, newAdminIdInput.trim(), newAdminPass)
-            if (err != null) {
-              adminCredsMsg = false to err
-            } else {
-              adminCredsMsg = true to (ok ?: "Admin credentials updated.")
-              adminCurrentPass = ""
-              newAdminPass = ""
-              confirmAdminPass = ""
+            scope.launch {
+              val (err, ok) = onUpdateAdminCredentials(adminCurrentPass, newAdminIdInput.trim(), newAdminPass)
+              if (err != null) {
+                adminCredsMsg = false to err
+              } else {
+                adminCredsMsg = true to (ok ?: "Admin credentials updated.")
+                adminCurrentPass = ""
+                newAdminPass = ""
+                confirmAdminPass = ""
+              }
             }
           }
         },
@@ -2848,9 +3052,11 @@ fun AdminAccessScreen(
           Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
               onClick = {
-                val err = onResetAdminClaim(adminCurrentPass)
-                if (err != null) {
-                  adminCredsMsg = false to err
+                scope.launch {
+                  val err = onResetAdminClaim(adminCurrentPass)
+                  if (err != null) {
+                    adminCredsMsg = false to err
+                  }
                 }
               },
               modifier = Modifier.weight(1f),

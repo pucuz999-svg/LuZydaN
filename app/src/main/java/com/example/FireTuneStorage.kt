@@ -324,4 +324,27 @@ class FireTuneStorage(context: Context) {
       prefs.edit().putString("local_session_user_id", userId).apply()
     }
   }
+
+  fun loadServerUrl(): String =
+    prefs.getString("server_sync_url", null)?.takeIf { it.isNotBlank() } ?: DEFAULT_SERVER_URL
+
+  fun saveServerUrl(url: String) {
+    val cleaned = url.trim().trimEnd('/')
+    if (cleaned.isEmpty()) {
+      prefs.edit().remove("server_sync_url").apply()
+    } else {
+      prefs.edit().putString("server_sync_url", cleaned).apply()
+    }
+  }
+
+  fun loadServerSyncEnabled(): Boolean = prefs.getBoolean("server_sync_enabled", true)
+
+  fun saveServerSyncEnabled(enabled: Boolean) {
+    prefs.edit().putBoolean("server_sync_enabled", enabled).apply()
+  }
+
+  companion object {
+    const val DEFAULT_SERVER_URL =
+      "https://ais-pre-g72iv3d37ma5zzpwsgan76-68606758093.asia-southeast1.run.app"
+  }
 }

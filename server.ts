@@ -474,6 +474,7 @@ function deriveCustomIdFromEmail(email: string, store: AuthStoreData): string {
   let suffix = 1;
   while (
     store.customers.some((c) => c.customId.toLowerCase() === candidate.toLowerCase()) ||
+    store.admins.some((a) => a.customId.toLowerCase() === candidate.toLowerCase()) ||
     store.requests.some((r) => r.status === 'pending' && r.customId.toLowerCase() === candidate.toLowerCase())
   ) {
     candidate = `${base.slice(0, 20)}_${suffix++}`;
@@ -638,7 +639,14 @@ function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFuncti
 
 async function startServer() {
   const app = express();
+  app.set('trust proxy', 1);
   app.use(express.json({ limit: '500kb' }));
+  app.use('/api', (_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    next();
+  });
 
   // Auth status: checks if Admin credentials are configured (env, claimed, or named admins)
   app.get('/api/auth/status', (_req, res) => {
@@ -1179,6 +1187,20 @@ async function startServer() {
       res.json({ request: sanitizeRequest(target) });
     }
   );
+
+  // Admin-only: Delete a Customer Request record
+  app.delete('/api/admin/requests/:id', requireAuth, requireAdmin, (req, res) => {
+    const id = req.params.id;
+    const store = ensureStore();
+    const idx = store.requests.findIndex((r) => r.id === id);
+    if (idx === -1) {
+      res.status(404).json({ error: 'Customer request not found.' });
+      return;
+    }
+    store.requests.splice(idx, 1);
+    saveStore(store);
+    res.json({ deleted: true });
+  });
 
   // Admin-only: List Customer ID/Password accounts
   app.get('/api/admin/customers', requireAuth, requireAdmin, (_req, res) => {

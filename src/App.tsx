@@ -78,6 +78,7 @@ export default function App() {
   const [launchModalOpen, setLaunchModalOpen] = useState(false);
   const [appliedStepsCount, setAppliedStepsCount] = useState(0);
   const [autoCopied, setAutoCopied] = useState(false);
+  const [pendingRequestCount, setPendingRequestCount] = useState(0);
   const pendingProfileOverrideRef = useRef<{
     sensitivity: SensitivityValues;
     fireButtonSize: number;
@@ -367,9 +368,45 @@ export default function App() {
     }
     setAuthToken(null);
     setAuthUser(null);
+    setPendingRequestCount(0);
     setActiveTab('sensitivity');
     setMobileMenuOpen(false);
   };
+
+  // Poll pending Mail ID request count so Admin sees incoming requests across any tab
+  useEffect(() => {
+    if (!authToken || authUser?.role !== 'admin') {
+      setPendingRequestCount(0);
+      return;
+    }
+    let cancelled = false;
+    const syncPending = async () => {
+      try {
+        const res = await fetch('/api/admin/requests', {
+          headers: { Authorization: `Bearer ${authToken}` },
+          cache: 'no-store',
+        });
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as { requests?: { status?: string }[] };
+        if (!cancelled && Array.isArray(data.requests)) {
+          setPendingRequestCount(
+            data.requests.filter((r) => r.status === 'pending').length
+          );
+        }
+      } catch {
+        // Ignore transient network errors
+      }
+    };
+    syncPending();
+    const timer = window.setInterval(syncPending, 8000);
+    const onFocus = () => syncPending();
+    window.addEventListener('focus', onFocus);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [authToken, authUser?.role, activeTab]);
 
   const activeNavLabel =
     navItems.find((n) => n.id === activeTab)?.label ?? 'Sensitivity & DPI';
@@ -484,6 +521,11 @@ export default function App() {
                     {savedProfiles.length}
                   </span>
                 )}
+                {item.id === 'admin' && pendingRequestCount > 0 && (
+                  <span className="rounded-md bg-orange-500 px-1.5 py-0.5 font-mono text-[11px] font-bold text-slate-950">
+                    {pendingRequestCount}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -568,6 +610,11 @@ export default function App() {
                     {item.id === 'saved' && savedProfiles.length > 0 && (
                       <span className="font-mono text-xs text-slate-400">
                         {savedProfiles.length}
+                      </span>
+                    )}
+                    {item.id === 'admin' && pendingRequestCount > 0 && (
+                      <span className="rounded-md bg-orange-500 px-1.5 py-0.5 font-mono text-[11px] font-bold text-slate-950">
+                        {pendingRequestCount}
                       </span>
                     )}
                   </button>
@@ -718,6 +765,7 @@ export default function App() {
                 setAuthUser(nextUser);
               }}
               onResetAdminClaim={handleLogout}
+              onPendingCountChange={setPendingRequestCount}
             />
           )}
         </main>

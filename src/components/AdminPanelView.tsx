@@ -40,6 +40,7 @@ interface AdminPanelViewProps {
   onCatalogOverridesChange: (next: CatalogOverrides) => void;
   onAdminCredentialsUpdated: (token: string, user: AuthUser) => void;
   onResetAdminClaim: () => void;
+  onPendingCountChange?: (count: number) => void;
 }
 
 type CatalogBrandFilter = 'all' | 'samsung' | 'xiaomi' | 'motorola' | 'vivo' | 'other';
@@ -303,6 +304,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   onCatalogOverridesChange,
   onAdminCredentialsUpdated,
   onResetAdminClaim,
+  onPendingCountChange,
 }) => {
   const [envOverrideActive, setEnvOverrideActive] = useState(false);
   const [customers, setCustomers] = useState<CustomerAccount[]>([]);
@@ -313,6 +315,8 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   const [rejectionReason, setRejectionReason] = useState('');
 
   const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Create customer form state
@@ -361,62 +365,105 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   const [catalogSaving, setCatalogSaving] = useState(false);
   const [catalogBanner, setCatalogBanner] = useState<string | null>(null);
 
-  const fetchAdminData = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [custRes, reqRes, admRes, statusRes] = await Promise.all([
-        fetch('/api/admin/customers', {
-          headers: { Authorization: `Bearer ${token}` },
-        }),
-        fetch('/api/admin/requests', {
-          headers: { Authorization: `Bearer ${token}` },
-        }),
-        fetch('/api/admin/admins', {
-          headers: { Authorization: `Bearer ${token}` },
-        }),
-        fetch('/api/auth/status'),
-      ]);
+  const fetchAdminData = useCallback(
+    async (silent = false) => {
+      if (silent) {
+        setSyncing(true);
+      } else {
+        setLoading(true);
+        setError(null);
+      }
+      try {
+        const [custRes, reqRes, admRes, statusRes] = await Promise.all([
+          fetch('/api/admin/customers', {
+            headers: { Authorization: `Bearer ${token}` },
+            cache: 'no-store',
+          }),
+          fetch('/api/admin/requests', {
+            headers: { Authorization: `Bearer ${token}` },
+            cache: 'no-store',
+          }),
+          fetch('/api/admin/admins', {
+            headers: { Authorization: `Bearer ${token}` },
+            cache: 'no-store',
+          }),
+          fetch('/api/auth/status', { cache: 'no-store' }),
+        ]);
 
-      const custData = await custRes.json();
-      const reqData = await reqRes.json();
-      const admData = await admRes.json();
-      if (statusRes.ok) {
-        const statusData = await statusRes.json();
-        setEnvOverrideActive(Boolean(statusData?.envOverrideActive));
-      }
+        if (custRes.status === 401 || reqRes.status === 401 || admRes.status === 401) {
+          onResetAdminClaim();
+          return;
+        }
 
-      if (!custRes.ok) {
-        setError(custData?.error || 'Could not load customer accounts.');
-        return;
-      }
-      if (!reqRes.ok) {
-        setError(reqData?.error || 'Could not load customer requests.');
-        return;
-      }
-      if (!admRes.ok) {
-        setError(admData?.error || 'Could not load admin accounts.');
-        return;
-      }
+        const custData = await custRes.json();
+        const reqData = await reqRes.json();
+        const admData = await admRes.json();
+        if (statusRes.ok) {
+          const statusData = await statusRes.json();
+          setEnvOverrideActive(Boolean(statusData?.envOverrideActive));
+        }
 
-      setCustomers(custData.customers || []);
-      setRequests(reqData.requests || []);
-      setAdmins(admData.admins || []);
-    } catch {
-      setError('Failed to reach server.');
-    } finally {
-      setLoading(false);
-    }
-  }, [token]);
+        if (!custRes.ok) {
+          if (!silent) setError(custData?.error || 'Could not load customer accounts.');
+          return;
+        }
+        if (!reqRes.ok) {
+          if (!silent) setError(reqData?.error || 'Could not load customer requests.');
+          return;
+        }
+        if (!admRes.ok) {
+          if (!silent) setError(admData?.error || 'Could not load admin accounts.');
+          return;
+        }
+
+        const nextReqs = (reqData.requests || []) as CustomerRequest[];
+        setCustomers(custData.customers || []);
+        setRequests(nextReqs);
+        setAdmins(admData.admins || []);
+        setLastSyncedAt(new Date().toLocaleTimeString());
+        onPendingCountChange?.(nextReqs.filter((r) => r.status === 'pending').length);
+      } catch {
+        if (!silent) setError('Failed to reach server.');
+      } finally {
+        setLoading(false);
+        setSyncing(false);
+      }
+    },
+    [token, onResetAdminClaim, onPendingCountChange]
+  );
 
   useEffect(() => {
-    fetchAdminData();
+    fetchAdminData(false);
+    const pollId = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        fetchAdminData(true);
+      }
+    }, 5000);
+    const handleFocus = () => {
+      fetchAdminData(true);
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        fetchAdminData(true);
+      }
+    };
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      window.clearInterval(pollId);
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
   }, [fetchAdminData]);
 
   const pendingCount = useMemo(
     () => requests.filter((r) => r.status === 'pending').length,
     [requests]
   );
+
+  useEffect(() => {
+    onPendingCountChange?.(pendingCount);
+  }, [pendingCount, onPendingCountChange]);
 
   const filteredRequests = useMemo(() => {
     if (requestFilter === 'all') return requests;
@@ -468,6 +515,25 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
       setRejectionReason('');
     } catch {
       setError(`Network error while processing ${decision}.`);
+    }
+  };
+
+  const handleDeleteRequest = async (requestId: string) => {
+    setError(null);
+    try {
+      const res = await fetch(`/api/admin/requests/${requestId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+        cache: 'no-store',
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        setError(data?.error || 'Failed to delete request.');
+        return;
+      }
+      setRequests((prev) => prev.filter((r) => r.id !== requestId));
+    } catch {
+      setError('Network error deleting request.');
     }
   };
 
@@ -956,6 +1022,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
             </div>
             <p className="mt-0.5 text-xs text-slate-400">
               {pendingCount} pending {pendingCount === 1 ? 'request' : 'requests'} awaiting Accept or Reject review
+              {lastSyncedAt ? ` · Live synced ${lastSyncedAt}` : ''}
             </p>
           </div>
 
@@ -986,10 +1053,10 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
 
             <button
               type="button"
-              onClick={fetchAdminData}
+              onClick={() => fetchAdminData(false)}
               className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white transition-colors"
             >
-              <RefreshCw className="h-3.5 w-3.5" />
+              <RefreshCw className={`h-3.5 w-3.5 ${syncing ? 'animate-spin text-orange-400' : ''}`} />
               Refresh
             </button>
           </div>
@@ -1113,12 +1180,21 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
                       )}
                     </div>
                   ) : (
-                    <div className="text-right text-xs text-slate-400 shrink-0">
+                    <div className="flex items-center gap-3 text-right text-xs text-slate-400 shrink-0">
                       {reqItem.reviewedAt && (
                         <span>
                           Reviewed {new Date(reqItem.reviewedAt).toLocaleDateString()}
                         </span>
                       )}
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteRequest(reqItem.id)}
+                        className="inline-flex items-center gap-1 rounded-md border border-slate-700 px-2.5 py-1.5 text-[11px] text-slate-300 hover:border-rose-500/50 hover:text-rose-300 transition-colors"
+                        title="Remove request record"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                        Remove
+                      </button>
                     </div>
                   )}
                 </div>

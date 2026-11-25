@@ -103,23 +103,67 @@ fun FireTuneApp() {
   var accessRequests by remember { mutableStateOf(storage.loadAccessRequests()) }
   var sessionUserId by remember { mutableStateOf(storage.loadSessionUserId()) }
 
-  val activeAuthUser = remember(adminConfig, authUsers, sessionUserId) {
-    val sid = sessionUserId ?: return@remember null
-    if (sid == "root-admin" && adminConfig != null) {
-      LocalAuthUser(
-        id = "root-admin",
-        email = "",
-        customId = adminConfig!!.adminId,
-        displayName = "Root Admin (${adminConfig!!.adminId})",
-        role = AuthRole.ADMIN,
-        passwordHash = "",
-        passwordSalt = "",
-        assignedDeviceId = "samsung-s24-ultra",
-        suspended = false,
-        createdAt = "",
-      )
+  var serverSyncEnabled by remember { mutableStateOf(storage.loadServerSyncEnabled()) }
+  var serverUrl by remember { mutableStateOf(storage.loadServerUrl()) }
+  var serverConnected by remember { mutableStateOf(false) }
+  var serverStatusError by remember { mutableStateOf<String?>(null) }
+  var remoteAdminConfigured by remember { mutableStateOf(false) }
+  var remoteSessionToken by remember { mutableStateOf<String?>(null) }
+  var remoteSessionUser by remember { mutableStateOf<LocalAuthUser?>(null) }
+
+  suspend fun checkRemoteStatus(url: String = serverUrl): Boolean {
+    return when (val res = FireTuneApi.fetchAuthStatus(url)) {
+      is ApiResult.Success -> {
+        remoteAdminConfigured = res.data.adminConfigured
+        serverConnected = true
+        serverStatusError = null
+        true
+      }
+      is ApiResult.Error -> {
+        serverConnected = false
+        serverStatusError = res.message
+        false
+      }
+    }
+  }
+
+  LaunchedEffect(serverSyncEnabled, serverUrl) {
+    if (serverSyncEnabled) {
+      checkRemoteStatus(serverUrl)
     } else {
-      authUsers.find { it.id == sid && !it.suspended }
+      serverConnected = false
+      serverStatusError = null
+    }
+  }
+
+  val activeAuthUser = remember(
+    serverSyncEnabled,
+    remoteSessionUser,
+    remoteSessionToken,
+    adminConfig,
+    authUsers,
+    sessionUserId,
+  ) {
+    if (serverSyncEnabled) {
+      if (remoteSessionToken != null) remoteSessionUser else null
+    } else {
+      val sid = sessionUserId ?: return@remember null
+      if (sid == "root-admin" && adminConfig != null) {
+        LocalAuthUser(
+          id = "root-admin",
+          email = "",
+          customId = adminConfig!!.adminId,
+          displayName = "Root Admin (${adminConfig!!.adminId})",
+          role = AuthRole.ADMIN,
+          passwordHash = "",
+          passwordSalt = "",
+          assignedDeviceId = "samsung-s24-ultra",
+          suspended = false,
+          createdAt = "",
+        )
+      } else {
+        authUsers.find { it.id == sid && !it.suspended }
+      }
     }
   }
 
@@ -135,41 +179,83 @@ fun FireTuneApp() {
   var rangeBias by remember { mutableStateOf(RangeBias.MID) }
 
   if (activeAuthUser == null) {
+    val effectiveAdminConfigured = if (serverSyncEnabled) {
+      remoteAdminConfigured
+    } else {
+      adminConfig != null || authUsers.any { it.role == AuthRole.ADMIN && !it.suspended }
+    }
+
     AuthGateScreen(
       devices = allDevices,
-      adminConfigured = adminConfig != null || authUsers.any { it.role == AuthRole.ADMIN && !it.suspended },
+      adminConfigured = effectiveAdminConfigured,
+      serverSyncEnabled = serverSyncEnabled,
+      serverUrl = serverUrl,
+      serverConnected = serverConnected,
+      serverStatusError = serverStatusError,
+      onSaveServerSettings = { enabled, nextUrl ->
+        storage.saveServerSyncEnabled(enabled)
+        serverSyncEnabled = enabled
+        if (!enabled) {
+          remoteSessionToken = null
+          remoteSessionUser = null
+          serverConnected = false
+          serverStatusError = null
+          return@AuthGateScreen null
+        }
+        val cleanUrl = FireTuneApi.normalizeBaseUrl(nextUrl)
+          ?: return@AuthGateScreen "Enter a valid https:// server URL."
+        storage.saveServerUrl(cleanUrl)
+        serverUrl = cleanUrl
+        val ok = checkRemoteStatus(cleanUrl)
+        if (ok) null else serverStatusError ?: "Could not connect to server."
+      },
       onUserLogin = { identifier, password ->
         val clean = identifier.trim().lowercase()
         if (clean.isEmpty() || password.isEmpty()) {
           return@AuthGateScreen "Enter your Email ID (or User ID) and password."
         }
-        val matchedUser = authUsers.find {
-          it.role == AuthRole.USER &&
-            (it.email.equals(clean, ignoreCase = true) || it.customId.equals(clean, ignoreCase = true))
-        }
-        if (matchedUser == null) {
-          val pending = accessRequests.find {
-            it.email.equals(clean, ignoreCase = true) || it.customId.equals(clean, ignoreCase = true)
+        if (serverSyncEnabled) {
+          when (val res = FireTuneApi.login(serverUrl, AuthRole.USER, clean, password)) {
+            is ApiResult.Success -> {
+              remoteSessionToken = res.data.token
+              remoteSessionUser = res.data.user
+              if (allDevices.any { it.id == res.data.user.assignedDeviceId }) {
+                selectedDeviceId = res.data.user.assignedDeviceId
+              }
+              activeTab = FireTuneTab.SENSITIVITY
+              null
+            }
+            is ApiResult.Error -> res.message
           }
-          return@AuthGateScreen when (pending?.status) {
-            RequestStatus.PENDING -> "Your login request is pending Admin approval."
-            RequestStatus.REJECTED -> "Your login request was declined by an Admin."
-            else -> "Invalid Email ID / User ID or password."
+        } else {
+          val matchedUser = authUsers.find {
+            it.role == AuthRole.USER &&
+              (it.email.equals(clean, ignoreCase = true) || it.customId.equals(clean, ignoreCase = true))
           }
+          if (matchedUser == null) {
+            val pending = accessRequests.find {
+              it.email.equals(clean, ignoreCase = true) || it.customId.equals(clean, ignoreCase = true)
+            }
+            return@AuthGateScreen when (pending?.status) {
+              RequestStatus.PENDING -> "Your login request is pending Admin approval."
+              RequestStatus.REJECTED -> "Your login request was declined by an Admin."
+              else -> "Invalid Email ID / User ID or password."
+            }
+          }
+          if (matchedUser.suspended) {
+            return@AuthGateScreen "This account is suspended. Contact Admin."
+          }
+          if (!LocalAuthCrypto.verifyPassword(password, matchedUser.passwordSalt, matchedUser.passwordHash)) {
+            return@AuthGateScreen "Invalid Email ID / User ID or password."
+          }
+          sessionUserId = matchedUser.id
+          storage.saveSessionUserId(matchedUser.id)
+          if (allDevices.any { it.id == matchedUser.assignedDeviceId }) {
+            selectedDeviceId = matchedUser.assignedDeviceId
+          }
+          activeTab = FireTuneTab.SENSITIVITY
+          null
         }
-        if (matchedUser.suspended) {
-          return@AuthGateScreen "This account is suspended. Contact Admin."
-        }
-        if (!LocalAuthCrypto.verifyPassword(password, matchedUser.passwordSalt, matchedUser.passwordHash)) {
-          return@AuthGateScreen "Invalid Email ID / User ID or password."
-        }
-        sessionUserId = matchedUser.id
-        storage.saveSessionUserId(matchedUser.id)
-        if (allDevices.any { it.id == matchedUser.assignedDeviceId }) {
-          selectedDeviceId = matchedUser.assignedDeviceId
-        }
-        activeTab = FireTuneTab.SENSITIVITY
-        null
       },
       onRequestLogin = { email, customIdInput, displayNameInput, password, deviceId, note ->
         val cleanEmail = email.trim().lowercase()
@@ -179,84 +265,134 @@ fun FireTuneApp() {
         if (password.length < 4) {
           return@AuthGateScreen "Password must be at least 4 characters." to null
         }
-        val resolvedId =
-          customIdInput.trim().lowercase().ifEmpty { LocalAuthCrypto.deriveCustomIdFromEmail(cleanEmail) }
-        val emailTaken =
-          authUsers.any { it.email.equals(cleanEmail, ignoreCase = true) } ||
-            accessRequests.any { it.status == RequestStatus.PENDING && it.email.equals(cleanEmail, ignoreCase = true) }
-        if (emailTaken) {
-          return@AuthGateScreen "A user or pending request with this Email ID already exists." to null
+        if (serverSyncEnabled) {
+          when (
+            val res = FireTuneApi.requestAccess(
+              baseUrl = serverUrl,
+              email = cleanEmail,
+              customId = customIdInput.trim(),
+              displayName = displayNameInput.trim().ifEmpty {
+                customIdInput.trim().ifEmpty { cleanEmail.substringBefore("@") }
+              },
+              password = password,
+              requestedDeviceId = deviceId,
+              note = note,
+            )
+          ) {
+            is ApiResult.Success -> {
+              serverConnected = true
+              serverStatusError = null
+              null to "Request sent to Admin for ${res.data.email} (@${res.data.customId}). Once granted access, sign in here."
+            }
+            is ApiResult.Error -> {
+              res.message to null
+            }
+          }
+        } else {
+          val resolvedId =
+            customIdInput.trim().lowercase().ifEmpty { LocalAuthCrypto.deriveCustomIdFromEmail(cleanEmail) }
+          val emailTaken =
+            authUsers.any { it.email.equals(cleanEmail, ignoreCase = true) } ||
+              accessRequests.any { it.status == RequestStatus.PENDING && it.email.equals(cleanEmail, ignoreCase = true) }
+          if (emailTaken) {
+            return@AuthGateScreen "A user or pending request with this Email ID already exists." to null
+          }
+          val idTaken =
+            authUsers.any { it.customId.equals(resolvedId, ignoreCase = true) } ||
+              accessRequests.any { it.status == RequestStatus.PENDING && it.customId.equals(resolvedId, ignoreCase = true) }
+          val finalCustomId = if (idTaken) "${resolvedId}_${(100..999).random()}" else resolvedId
+          val salt = LocalAuthCrypto.generateSalt()
+          val hash = LocalAuthCrypto.hashPassword(password, salt)
+          val nowStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+          val req = LocalAccessRequest(
+            id = "req-${System.currentTimeMillis()}",
+            email = cleanEmail,
+            customId = finalCustomId,
+            displayName = displayNameInput.trim().ifEmpty { finalCustomId },
+            passwordHash = hash,
+            passwordSalt = salt,
+            requestedDeviceId = deviceId,
+            note = note,
+            status = RequestStatus.PENDING,
+            createdAt = nowStr,
+          )
+          val nextReqs = listOf(req) + accessRequests
+          accessRequests = nextReqs
+          storage.saveAccessRequests(nextReqs)
+          null to "Request saved locally for $cleanEmail (@$finalCustomId). Enable Server Sync to send requests to a remote Admin."
         }
-        val idTaken =
-          authUsers.any { it.customId.equals(resolvedId, ignoreCase = true) } ||
-            accessRequests.any { it.status == RequestStatus.PENDING && it.customId.equals(resolvedId, ignoreCase = true) }
-        val finalCustomId = if (idTaken) "${resolvedId}_${(100..999).random()}" else resolvedId
-        val salt = LocalAuthCrypto.generateSalt()
-        val hash = LocalAuthCrypto.hashPassword(password, salt)
-        val nowStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
-        val req = LocalAccessRequest(
-          id = "req-${System.currentTimeMillis()}",
-          email = cleanEmail,
-          customId = finalCustomId,
-          displayName = displayNameInput.trim().ifEmpty { finalCustomId },
-          passwordHash = hash,
-          passwordSalt = salt,
-          requestedDeviceId = deviceId,
-          note = note,
-          status = RequestStatus.PENDING,
-          createdAt = nowStr,
-        )
-        val nextReqs = listOf(req) + accessRequests
-        accessRequests = nextReqs
-        storage.saveAccessRequests(nextReqs)
-        null to "Request submitted for $cleanEmail (@$finalCustomId). Ask Admin to grant access, then sign in here."
       },
       onAdminClaim = { adminId, password ->
         val cleanId = adminId.trim().lowercase()
-        if (cleanId.length < 2) {
-          return@AuthGateScreen "Admin ID must be at least 2 characters."
+        if (cleanId.length < 3) {
+          return@AuthGateScreen "Admin ID must be at least 3 characters."
         }
         if (password.length < 6) {
           return@AuthGateScreen "Admin password must be at least 6 characters."
         }
-        val salt = LocalAuthCrypto.generateSalt()
-        val hash = LocalAuthCrypto.hashPassword(password, salt)
-        val cfg = LocalAdminConfig(cleanId, hash, salt)
-        adminConfig = cfg
-        storage.saveAdminConfig(cfg)
-        sessionUserId = "root-admin"
-        storage.saveSessionUserId("root-admin")
-        activeTab = FireTuneTab.ADMIN
-        null
+        if (serverSyncEnabled) {
+          when (val res = FireTuneApi.claimAdmin(serverUrl, cleanId, password)) {
+            is ApiResult.Success -> {
+              remoteAdminConfigured = true
+              remoteSessionToken = res.data.token
+              remoteSessionUser = res.data.user
+              activeTab = FireTuneTab.ADMIN
+              null
+            }
+            is ApiResult.Error -> res.message
+          }
+        } else {
+          val salt = LocalAuthCrypto.generateSalt()
+          val hash = LocalAuthCrypto.hashPassword(password, salt)
+          val cfg = LocalAdminConfig(cleanId, hash, salt)
+          adminConfig = cfg
+          storage.saveAdminConfig(cfg)
+          sessionUserId = "root-admin"
+          storage.saveSessionUserId("root-admin")
+          activeTab = FireTuneTab.ADMIN
+          null
+        }
       },
       onAdminLogin = { adminId, password ->
         val cleanId = adminId.trim().lowercase()
         if (cleanId.isEmpty() || password.isEmpty()) {
           return@AuthGateScreen "Enter Admin ID and password."
         }
-        val rootCfg = adminConfig
-        if (rootCfg != null && rootCfg.adminId.equals(cleanId, ignoreCase = true) &&
-          LocalAuthCrypto.verifyPassword(password, rootCfg.passwordSalt, rootCfg.passwordHash)
-        ) {
-          sessionUserId = "root-admin"
-          storage.saveSessionUserId("root-admin")
-          activeTab = FireTuneTab.ADMIN
-          return@AuthGateScreen null
+        if (serverSyncEnabled) {
+          when (val res = FireTuneApi.login(serverUrl, AuthRole.ADMIN, cleanId, password)) {
+            is ApiResult.Success -> {
+              remoteSessionToken = res.data.token
+              remoteSessionUser = res.data.user
+              activeTab = FireTuneTab.ADMIN
+              null
+            }
+            is ApiResult.Error -> res.message
+          }
+        } else {
+          val rootCfg = adminConfig
+          if (rootCfg != null && rootCfg.adminId.equals(cleanId, ignoreCase = true) &&
+            LocalAuthCrypto.verifyPassword(password, rootCfg.passwordSalt, rootCfg.passwordHash)
+          ) {
+            sessionUserId = "root-admin"
+            storage.saveSessionUserId("root-admin")
+            activeTab = FireTuneTab.ADMIN
+            return@AuthGateScreen null
+          }
+          val adminUser = authUsers.find {
+            it.role == AuthRole.ADMIN &&
+              !it.suspended &&
+              (it.customId.equals(cleanId, ignoreCase = true) || it.email.equals(cleanId, ignoreCase = true))
+          }
+          if (adminUser != null &&
+            LocalAuthCrypto.verifyPassword(password, adminUser.passwordSalt, adminUser.passwordHash)
+          ) {
+            sessionUserId = adminUser.id
+            storage.saveSessionUserId(adminUser.id)
+            activeTab = FireTuneTab.ADMIN
+            return@AuthGateScreen null
+          }
+          "Invalid Admin ID or password."
         }
-        val adminUser = authUsers.find {
-          it.role == AuthRole.ADMIN &&
-            !it.suspended &&
-            (it.customId.equals(cleanId, ignoreCase = true) || it.email.equals(cleanId, ignoreCase = true))
-        }
-        if (adminUser != null &&
-          LocalAuthCrypto.verifyPassword(password, adminUser.passwordSalt, adminUser.passwordHash)
-        ) {
-          sessionUserId = adminUser.id
-          storage.saveSessionUserId(adminUser.id)
-          activeTab = FireTuneTab.ADMIN
-          return@AuthGateScreen null
-        }
-        "Invalid Admin ID or password."
       },
     )
     return
@@ -347,6 +483,8 @@ fun FireTuneApp() {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
               TextButton(
                 onClick = {
+                  remoteSessionToken = null
+                  remoteSessionUser = null
                   sessionUserId = null
                   storage.saveSessionUserId(null)
                 },
@@ -574,44 +712,107 @@ fun FireTuneApp() {
           requests = accessRequests,
           users = authUsers,
           currentAdminId = activeAuthUser.customId,
-          isRootAdmin = activeAuthUser.id == "root-admin",
+          isRootAdmin = activeAuthUser.id == "root-admin" || activeAuthUser.id == "admin-root",
+          serverSyncEnabled = serverSyncEnabled,
+          onRefreshData = {
+            if (!serverSyncEnabled) {
+              accessRequests = storage.loadAccessRequests()
+              authUsers = storage.loadAuthUsers()
+              return@AdminAccessScreen null
+            }
+            val token = remoteSessionToken ?: return@AdminAccessScreen "Session expired. Sign in again."
+            val reqRes = FireTuneApi.fetchRequests(serverUrl, token)
+            val custRes = FireTuneApi.fetchCustomers(serverUrl, token)
+            if (reqRes is ApiResult.Error && reqRes.code == 401) {
+              remoteSessionToken = null
+              remoteSessionUser = null
+              return@AdminAccessScreen "Session expired. Please sign in again."
+            }
+            if (reqRes is ApiResult.Success) {
+              accessRequests = reqRes.data
+            }
+            if (custRes is ApiResult.Success) {
+              authUsers = custRes.data
+            }
+            when {
+              reqRes is ApiResult.Error -> reqRes.message
+              custRes is ApiResult.Error -> custRes.message
+              else -> null
+            }
+          },
           onApproveRequest = { reqId ->
-            val req = accessRequests.find { it.id == reqId } ?: return@AdminAccessScreen
-            val nowStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
-            val nextReqs = accessRequests.map {
-              if (it.id == reqId) it.copy(status = RequestStatus.APPROVED, decidedAt = nowStr) else it
+            if (serverSyncEnabled) {
+              val token = remoteSessionToken ?: return@AdminAccessScreen "Session expired."
+              when (val res = FireTuneApi.decideRequest(serverUrl, token, reqId, "accept")) {
+                is ApiResult.Success -> {
+                  val updatedReq = res.data.first
+                  val newCust = res.data.second
+                  if (updatedReq != null) {
+                    accessRequests = accessRequests.map { if (it.id == reqId) updatedReq else it }
+                  }
+                  if (newCust != null) {
+                    authUsers = listOf(newCust) + authUsers
+                  }
+                  snackbarHostState.showSnackbar("Granted access")
+                  null
+                }
+                is ApiResult.Error -> res.message
+              }
+            } else {
+              val req = accessRequests.find { it.id == reqId } ?: return@AdminAccessScreen "Request not found."
+              val nowStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+              val nextReqs = accessRequests.map {
+                if (it.id == reqId) it.copy(status = RequestStatus.APPROVED, decidedAt = nowStr) else it
+              }
+              val alreadyUser = authUsers.any { it.email.equals(req.email, ignoreCase = true) }
+              val nextUsers = if (alreadyUser) authUsers else {
+                listOf(
+                  LocalAuthUser(
+                    id = "usr-${System.currentTimeMillis()}",
+                    email = req.email,
+                    customId = req.customId,
+                    displayName = req.displayName,
+                    role = AuthRole.USER,
+                    passwordHash = req.passwordHash,
+                    passwordSalt = req.passwordSalt,
+                    assignedDeviceId = req.requestedDeviceId,
+                    suspended = false,
+                    createdAt = nowStr,
+                  )
+                ) + authUsers
+              }
+              accessRequests = nextReqs
+              authUsers = nextUsers
+              storage.saveAccessRequests(nextReqs)
+              storage.saveAuthUsers(nextUsers)
+              snackbarHostState.showSnackbar("Granted access to ${req.email}")
+              null
             }
-            val alreadyUser = authUsers.any { it.email.equals(req.email, ignoreCase = true) }
-            val nextUsers = if (alreadyUser) authUsers else {
-              listOf(
-                LocalAuthUser(
-                  id = "usr-${System.currentTimeMillis()}",
-                  email = req.email,
-                  customId = req.customId,
-                  displayName = req.displayName,
-                  role = AuthRole.USER,
-                  passwordHash = req.passwordHash,
-                  passwordSalt = req.passwordSalt,
-                  assignedDeviceId = req.requestedDeviceId,
-                  suspended = false,
-                  createdAt = nowStr,
-                )
-              ) + authUsers
-            }
-            accessRequests = nextReqs
-            authUsers = nextUsers
-            storage.saveAccessRequests(nextReqs)
-            storage.saveAuthUsers(nextUsers)
-            scope.launch { snackbarHostState.showSnackbar("Granted access to ${req.email}") }
           },
           onRejectRequest = { reqId ->
-            val nowStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
-            val nextReqs = accessRequests.map {
-              if (it.id == reqId) it.copy(status = RequestStatus.REJECTED, decidedAt = nowStr) else it
+            if (serverSyncEnabled) {
+              val token = remoteSessionToken ?: return@AdminAccessScreen "Session expired."
+              when (val res = FireTuneApi.decideRequest(serverUrl, token, reqId, "reject")) {
+                is ApiResult.Success -> {
+                  val updatedReq = res.data.first
+                  if (updatedReq != null) {
+                    accessRequests = accessRequests.map { if (it.id == reqId) updatedReq else it }
+                  }
+                  snackbarHostState.showSnackbar("Request rejected")
+                  null
+                }
+                is ApiResult.Error -> res.message
+              }
+            } else {
+              val nowStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+              val nextReqs = accessRequests.map {
+                if (it.id == reqId) it.copy(status = RequestStatus.REJECTED, decidedAt = nowStr) else it
+              }
+              accessRequests = nextReqs
+              storage.saveAccessRequests(nextReqs)
+              snackbarHostState.showSnackbar("Request rejected")
+              null
             }
-            accessRequests = nextReqs
-            storage.saveAccessRequests(nextReqs)
-            scope.launch { snackbarHostState.showSnackbar("Request rejected") }
           },
           onCreateUser = { emailInput, customIdInput, displayNameInput, pwInput, devId, role ->
             val cleanEmail = emailInput.trim().lowercase()
@@ -622,51 +823,110 @@ fun FireTuneApp() {
             if (pwInput.length < minLen) {
               return@AdminAccessScreen "Password must be at least $minLen characters." to null
             }
-            if (authUsers.any { it.email.equals(cleanEmail, ignoreCase = true) }) {
-              return@AdminAccessScreen "Account with this Email ID already exists." to null
-            }
             val resolvedId = customIdInput.trim().lowercase().ifEmpty { LocalAuthCrypto.deriveCustomIdFromEmail(cleanEmail) }
-            val salt = LocalAuthCrypto.generateSalt()
-            val hash = LocalAuthCrypto.hashPassword(pwInput, salt)
-            val nowStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
-            val newUser = LocalAuthUser(
-              id = "usr-${System.currentTimeMillis()}",
-              email = cleanEmail,
-              customId = resolvedId,
-              displayName = displayNameInput.trim().ifEmpty { resolvedId },
-              role = role,
-              passwordHash = hash,
-              passwordSalt = salt,
-              assignedDeviceId = devId,
-              suspended = false,
-              createdAt = nowStr,
-            )
-            val nextUsers = listOf(newUser) + authUsers
-            authUsers = nextUsers
-            storage.saveAuthUsers(nextUsers)
-            null to "Created ${role.name.lowercase()} account for $cleanEmail"
+            if (serverSyncEnabled) {
+              val token = remoteSessionToken ?: return@AdminAccessScreen ("Session expired." to null)
+              if (role == AuthRole.ADMIN) {
+                return@AdminAccessScreen ("Create extra Admin accounts from the Web Admin Dashboard." to null)
+              }
+              when (
+                val res = FireTuneApi.createCustomer(
+                  baseUrl = serverUrl,
+                  token = token,
+                  email = cleanEmail,
+                  customId = resolvedId,
+                  displayName = displayNameInput.trim().ifEmpty { resolvedId },
+                  password = pwInput,
+                  deviceId = devId,
+                )
+              ) {
+                is ApiResult.Success -> {
+                  authUsers = listOf(res.data) + authUsers
+                  null to "Created user account for $cleanEmail"
+                }
+                is ApiResult.Error -> res.message to null
+              }
+            } else {
+              if (authUsers.any { it.email.equals(cleanEmail, ignoreCase = true) }) {
+                return@AdminAccessScreen "Account with this Email ID already exists." to null
+              }
+              val salt = LocalAuthCrypto.generateSalt()
+              val hash = LocalAuthCrypto.hashPassword(pwInput, salt)
+              val nowStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+              val newUser = LocalAuthUser(
+                id = "usr-${System.currentTimeMillis()}",
+                email = cleanEmail,
+                customId = resolvedId,
+                displayName = displayNameInput.trim().ifEmpty { resolvedId },
+                role = role,
+                passwordHash = hash,
+                passwordSalt = salt,
+                assignedDeviceId = devId,
+                suspended = false,
+                createdAt = nowStr,
+              )
+              val nextUsers = listOf(newUser) + authUsers
+              authUsers = nextUsers
+              storage.saveAuthUsers(nextUsers)
+              null to "Created ${role.name.lowercase()} account for $cleanEmail"
+            }
           },
           onToggleSuspend = { userId ->
-            val nextUsers = authUsers.map {
-              if (it.id == userId) it.copy(suspended = !it.suspended) else it
+            if (serverSyncEnabled) {
+              val token = remoteSessionToken ?: return@AdminAccessScreen "Session expired."
+              val target = authUsers.find { it.id == userId } ?: return@AdminAccessScreen "User not found."
+              when (val res = FireTuneApi.toggleCustomerActive(serverUrl, token, userId, target.suspended)) {
+                is ApiResult.Success -> {
+                  authUsers = authUsers.map { if (it.id == userId) res.data else it }
+                  null
+                }
+                is ApiResult.Error -> res.message
+              }
+            } else {
+              val nextUsers = authUsers.map {
+                if (it.id == userId) it.copy(suspended = !it.suspended) else it
+              }
+              authUsers = nextUsers
+              storage.saveAuthUsers(nextUsers)
+              null
             }
-            authUsers = nextUsers
-            storage.saveAuthUsers(nextUsers)
           },
           onDeleteUser = { userId ->
-            val nextUsers = authUsers.filterNot { it.id == userId }
-            authUsers = nextUsers
-            storage.saveAuthUsers(nextUsers)
+            if (serverSyncEnabled) {
+              val token = remoteSessionToken ?: return@AdminAccessScreen "Session expired."
+              when (val res = FireTuneApi.deleteCustomer(serverUrl, token, userId)) {
+                is ApiResult.Success -> {
+                  authUsers = authUsers.filterNot { it.id == userId }
+                  null
+                }
+                is ApiResult.Error -> res.message
+              }
+            } else {
+              val nextUsers = authUsers.filterNot { it.id == userId }
+              authUsers = nextUsers
+              storage.saveAuthUsers(nextUsers)
+              null
+            }
           },
           onUpdateAdminCredentials = { currentPw, nextAdminId, nextPw ->
             val cleanId = nextAdminId.trim().lowercase()
-            if (cleanId.length < 2) {
-              return@AdminAccessScreen "Admin ID must be at least 2 characters." to null
+            if (cleanId.length < 3) {
+              return@AdminAccessScreen "Admin ID must be at least 3 characters." to null
             }
             if (nextPw.length < 6) {
               return@AdminAccessScreen "New admin password must be at least 6 characters." to null
             }
-            if (activeAuthUser.id == "root-admin") {
+            if (serverSyncEnabled) {
+              val token = remoteSessionToken ?: return@AdminAccessScreen ("Session expired." to null)
+              when (val res = FireTuneApi.updateAdminCredentials(serverUrl, token, currentPw, cleanId, nextPw)) {
+                is ApiResult.Success -> {
+                  remoteSessionToken = res.data.token
+                  remoteSessionUser = res.data.user
+                  null to "Admin credentials updated for @$cleanId."
+                }
+                is ApiResult.Error -> res.message to null
+              }
+            } else if (activeAuthUser.id == "root-admin") {
               val rootCfg = adminConfig ?: return@AdminAccessScreen "No claimed admin credentials exist yet." to null
               if (!LocalAuthCrypto.verifyPassword(currentPw, rootCfg.passwordSalt, rootCfg.passwordHash)) {
                 return@AdminAccessScreen "Current admin password is incorrect." to null
@@ -694,15 +954,28 @@ fun FireTuneApp() {
             }
           },
           onResetAdminClaim = { currentPw ->
-            val rootCfg = adminConfig ?: return@AdminAccessScreen "No claimed admin credentials exist yet."
-            if (!LocalAuthCrypto.verifyPassword(currentPw, rootCfg.passwordSalt, rootCfg.passwordHash)) {
-              return@AdminAccessScreen "Current admin password is required to reset."
+            if (serverSyncEnabled) {
+              val token = remoteSessionToken ?: return@AdminAccessScreen "Session expired."
+              when (val res = FireTuneApi.resetAdminClaim(serverUrl, token, currentPw)) {
+                is ApiResult.Success -> {
+                  remoteSessionToken = null
+                  remoteSessionUser = null
+                  remoteAdminConfigured = false
+                  null
+                }
+                is ApiResult.Error -> res.message
+              }
+            } else {
+              val rootCfg = adminConfig ?: return@AdminAccessScreen "No claimed admin credentials exist yet."
+              if (!LocalAuthCrypto.verifyPassword(currentPw, rootCfg.passwordSalt, rootCfg.passwordHash)) {
+                return@AdminAccessScreen "Current admin password is required to reset."
+              }
+              storage.clearAdminConfig()
+              storage.saveSessionUserId(null)
+              adminConfig = null
+              sessionUserId = null
+              null
             }
-            storage.clearAdminConfig()
-            storage.saveSessionUserId(null)
-            adminConfig = null
-            sessionUserId = null
-            null
           },
           onOpenCalibrationStudio = { activeTab = FireTuneTab.SENSITIVITY },
         )

@@ -41,10 +41,16 @@ export const LoginView: React.FC<LoginViewProps> = ({
   const [requestSuccess, setRequestSuccess] = useState<string | null>(null);
 
   useEffect(() => {
+    if (devices.length > 0 && !devices.some((d) => d.id === requestedDeviceId)) {
+      setRequestedDeviceId(devices[0].id);
+    }
+  }, [devices, requestedDeviceId]);
+
+  useEffect(() => {
     let active = true;
     const loadStatus = async () => {
       try {
-        const res = await fetch('/api/auth/status');
+        const res = await fetch('/api/auth/status', { cache: 'no-store' });
         const contentType = res.headers.get('content-type') || '';
         if (res.ok && contentType.includes('application/json') && active) {
           const data = (await res.json()) as AuthStatus;
@@ -107,18 +113,28 @@ export const LoginView: React.FC<LoginViewProps> = ({
         const res = await fetch('/api/auth/request-access', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          cache: 'no-store',
           body: JSON.stringify({
             email: trimmedEmail,
             customId: customId.trim(),
             displayName: displayName.trim() || customId.trim() || trimmedEmail.split('@')[0],
             password,
-            requestedDeviceId,
+            requestedDeviceId:
+              devices.some((d) => d.id === requestedDeviceId)
+                ? requestedDeviceId
+                : devices[0]?.id || 'samsung-a54',
             note: requestNote.trim(),
           }),
         });
-        const data = await res.json();
+        const text = await res.text();
+        let data: { error?: string; request?: { customId?: string } } = {};
+        try {
+          data = text ? JSON.parse(text) : {};
+        } catch {
+          data = {};
+        }
         if (!res.ok) {
-          setError(data?.error || 'Could not submit login request.');
+          setError(data?.error || `Could not submit login request (HTTP ${res.status}).`);
           return;
         }
         const assignedId = data?.request?.customId;
@@ -166,11 +182,18 @@ export const LoginView: React.FC<LoginViewProps> = ({
         const res = await fetch('/api/auth/admin/claim', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          cache: 'no-store',
           body: JSON.stringify({ customId: trimmedId, password }),
         });
-        const data = await res.json();
-        if (!res.ok) {
-          setError(data?.error || 'Failed to claim admin account.');
+        const text = await res.text();
+        let data: { error?: string; token?: string; user?: AuthUser } = {};
+        try {
+          data = text ? JSON.parse(text) : {};
+        } catch {
+          data = {};
+        }
+        if (!res.ok || !data.token || !data.user) {
+          setError(data?.error || `Failed to claim admin account (HTTP ${res.status}).`);
           return;
         }
         onLoginSuccess(data.token, data.user);
@@ -187,11 +210,18 @@ export const LoginView: React.FC<LoginViewProps> = ({
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
         body: JSON.stringify({ role, customId: trimmedId, password }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data?.error || 'Invalid credentials.');
+      const text = await res.text();
+      let data: { error?: string; token?: string; user?: AuthUser } = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        data = {};
+      }
+      if (!res.ok || !data.token || !data.user) {
+        setError(data?.error || `Invalid credentials (HTTP ${res.status}).`);
         return;
       }
       onLoginSuccess(data.token, data.user);
@@ -367,13 +397,13 @@ export const LoginView: React.FC<LoginViewProps> = ({
 
                   <div>
                     <label
-                      htmlFor="login-custom-id"
+                      htmlFor="req-custom-id"
                       className="block text-xs font-medium text-slate-300"
                     >
                       User ID (Optional)
                     </label>
                     <input
-                      id="login-custom-id"
+                      id="req-custom-id"
                       type="text"
                       value={customId}
                       onChange={(e) => setCustomId(e.target.value)}
