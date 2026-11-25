@@ -107,18 +107,60 @@ interface CatalogStoreData {
   removedIds: string[];
 }
 
-const PORT = 3000;
-const SESSION_SECRET =
-  process.env.AUTH_SESSION_SECRET || crypto.randomBytes(32).toString('hex');
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
-
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const STORE_PATH = path.resolve(DATA_DIR, 'auth-store.json');
 const CATALOG_PATH = path.resolve(DATA_DIR, 'device-catalog.json');
+const SESSION_SECRET_PATH = path.resolve(DATA_DIR, '.session-secret');
 
-if (!STORE_PATH.startsWith(DATA_DIR + path.sep) || !CATALOG_PATH.startsWith(DATA_DIR + path.sep)) {
+if (
+  !STORE_PATH.startsWith(DATA_DIR + path.sep) ||
+  !CATALOG_PATH.startsWith(DATA_DIR + path.sep) ||
+  !SESSION_SECRET_PATH.startsWith(DATA_DIR + path.sep)
+) {
   throw new Error('Invalid store path configuration');
 }
+
+function resolvePort(): number {
+  const argIdx = process.argv.findIndex((a) => a === '--port' || a === '-p');
+  if (argIdx >= 0 && process.argv[argIdx + 1]) {
+    const parsed = Number(process.argv[argIdx + 1]);
+    if (Number.isInteger(parsed) && parsed > 0 && parsed < 65536) return parsed;
+  }
+  for (const arg of process.argv) {
+    if (arg.startsWith('--port=')) {
+      const parsed = Number(arg.slice('--port='.length));
+      if (Number.isInteger(parsed) && parsed > 0 && parsed < 65536) return parsed;
+    }
+  }
+  if (process.env.NODE_ENV === 'production' && process.env.PORT) {
+    const envPort = Number(process.env.PORT);
+    if (Number.isInteger(envPort) && envPort > 0 && envPort < 65536) return envPort;
+  }
+  return 3000;
+}
+
+function resolveSessionSecret(): string {
+  const envSecret = (process.env.AUTH_SESSION_SECRET || '').trim();
+  if (envSecret) return envSecret;
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    if (fs.existsSync(SESSION_SECRET_PATH)) {
+      const existing = fs.readFileSync(SESSION_SECRET_PATH, 'utf8').trim();
+      if (existing.length >= 32) return existing;
+    }
+    const generated = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(SESSION_SECRET_PATH, generated, { mode: 0o600 });
+    return generated;
+  } catch {
+    return crypto.randomBytes(32).toString('hex');
+  }
+}
+
+const PORT = resolvePort();
+const SESSION_SECRET = resolveSessionSecret();
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
 function ensureStore(): AuthStoreData {
   if (!fs.existsSync(DATA_DIR)) {
@@ -168,12 +210,24 @@ function saveStore(data: AuthStoreData): void {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
-  const tempPath = path.resolve(DATA_DIR, `auth-store.${process.pid}.tmp`);
+  const tempPath = path.resolve(
+    DATA_DIR,
+    `auth-store.${process.pid}.${crypto.randomUUID()}.tmp`
+  );
   if (!tempPath.startsWith(DATA_DIR + path.sep)) {
     throw new Error('Invalid temp store path');
   }
-  fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), { mode: 0o600 });
-  fs.renameSync(tempPath, STORE_PATH);
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+    fs.renameSync(tempPath, STORE_PATH);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch {
+      // Ignore temp cleanup failure
+    }
+    throw err;
+  }
 }
 
 function readCatalogStore(): CatalogStoreData {
@@ -198,12 +252,24 @@ function saveCatalogStore(data: CatalogStoreData): void {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
-  const tempPath = path.resolve(DATA_DIR, `device-catalog.${process.pid}.tmp`);
+  const tempPath = path.resolve(
+    DATA_DIR,
+    `device-catalog.${process.pid}.${crypto.randomUUID()}.tmp`
+  );
   if (!tempPath.startsWith(DATA_DIR + path.sep)) {
     throw new Error('Invalid temp catalog path');
   }
-  fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), { mode: 0o600 });
-  fs.renameSync(tempPath, CATALOG_PATH);
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+    fs.renameSync(tempPath, CATALOG_PATH);
+  } catch (err) {
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch {
+      // Ignore temp cleanup failure
+    }
+    throw err;
+  }
 }
 
 const VALID_TIERS = new Set(['low', 'mid', 'high', 'gaming', 'ios']);
@@ -605,6 +671,40 @@ function isSameOriginMutation(req: Request): boolean {
   }
 }
 
+function resolveActiveSessionUser(payload: SessionPayload): SessionPayload | null {
+  const store = ensureStore();
+  if (payload.role === 'customer') {
+    const c = store.customers.find((item) => item.id === payload.sub);
+    if (!c || !c.active) return null;
+    return {
+      ...payload,
+      customId: c.customId,
+      email: c.email,
+      displayName: c.displayName,
+      assignedDeviceId: c.assignedDeviceId,
+    };
+  }
+  if (payload.sub === 'admin-root') {
+    const envAdmin = getEffectiveEnvAdmin(store);
+    if (envAdmin) {
+      return envAdmin.adminId.toLowerCase() === payload.customId.toLowerCase()
+        ? { ...payload, customId: envAdmin.adminId }
+        : null;
+    }
+    if (!store.adminClaim) return null;
+    return store.adminClaim.adminId.toLowerCase() === payload.customId.toLowerCase()
+      ? { ...payload, customId: store.adminClaim.adminId }
+      : null;
+  }
+  const a = store.admins.find((item) => item.id === payload.sub);
+  if (!a || !a.active) return null;
+  return {
+    ...payload,
+    customId: a.customId,
+    displayName: a.displayName,
+  };
+}
+
 function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   const header = req.headers.authorization || '';
   const bearerToken = header.startsWith('Bearer ')
@@ -621,11 +721,15 @@ function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunctio
     return;
   }
   const payload = verifySessionToken(token);
-  if (!payload) {
+  const activePayload = payload ? resolveActiveSessionUser(payload) : null;
+  if (!activePayload) {
+    if (!bearerToken && cookieToken) {
+      clearSessionCookie(req, res);
+    }
     res.status(401).json({ error: 'Session expired or invalid' });
     return;
   }
-  req.authUser = payload;
+  req.authUser = activePayload;
   next();
 }
 
@@ -639,13 +743,21 @@ function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFuncti
 
 async function startServer() {
   const app = express();
+  app.disable('x-powered-by');
   app.set('trust proxy', 1);
-  app.use(express.json({ limit: '500kb' }));
+  app.use(express.json({ limit: '2mb' }));
   app.use('/api', (_req, res, next) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
     next();
+  });
+
+  app.get('/api/health', (_req, res) => {
+    res.json({
+      ok: true,
+      uptimeSeconds: Math.floor(process.uptime()),
+    });
   });
 
   // Auth status: checks if Admin credentials are configured (env, claimed, or named admins)
@@ -1049,47 +1161,34 @@ async function startServer() {
     const cookieToken = parseCookieValue(req.headers.cookie, SESSION_COOKIE_NAME) || '';
     const token = bearerToken || cookieToken;
     const payload = token ? verifySessionToken(token) : null;
-    if (!payload) {
+    const activePayload = payload ? resolveActiveSessionUser(payload) : null;
+    if (!activePayload) {
+      if (cookieToken) {
+        clearSessionCookie(req, res);
+      }
       res.json({ authenticated: false, token: null, user: null });
       return;
     }
 
-    const store = ensureStore();
-    if (payload.role === 'customer') {
-      const c = store.customers.find((item) => item.id === payload.sub);
-      if (!c || !c.active) {
-        clearSessionCookie(req, res);
-        res.json({ authenticated: false, token: null, user: null });
-        return;
-      }
-    } else if (payload.sub !== 'admin-root') {
-      const a = store.admins.find((item) => item.id === payload.sub);
-      if (!a || !a.active) {
-        clearSessionCookie(req, res);
-        res.json({ authenticated: false, token: null, user: null });
-        return;
-      }
-    }
-
     const freshToken = signSessionToken({
-      sub: payload.sub,
-      role: payload.role,
-      customId: payload.customId,
-      email: payload.email,
-      displayName: payload.displayName,
-      assignedDeviceId: payload.assignedDeviceId,
+      sub: activePayload.sub,
+      role: activePayload.role,
+      customId: activePayload.customId,
+      email: activePayload.email,
+      displayName: activePayload.displayName,
+      assignedDeviceId: activePayload.assignedDeviceId,
     });
     setSessionCookie(req, res, freshToken);
     res.json({
       authenticated: true,
       token: freshToken,
       user: {
-        id: payload.sub,
-        role: payload.role,
-        customId: payload.customId,
-        email: payload.email,
-        displayName: payload.displayName,
-        assignedDeviceId: payload.assignedDeviceId,
+        id: activePayload.sub,
+        role: activePayload.role,
+        customId: activePayload.customId,
+        email: activePayload.email,
+        displayName: activePayload.displayName,
+        assignedDeviceId: activePayload.assignedDeviceId,
       },
     });
   });
@@ -1710,26 +1809,88 @@ async function startServer() {
     res.json({ overrides: catalog });
   });
 
+  // Ensure unknown /api/* paths always return structured JSON 404 rather than SPA HTML
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found.' });
+  });
+
   // Vite middleware in dev, static dist/ in production
   const isProd = process.env.NODE_ENV === 'production';
   if (!isProd) {
+    if (!process.env.DISABLE_HMR) {
+      process.env.DISABLE_HMR = 'true';
+    }
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+        ws: false,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distDir));
+    const indexHtmlPath = path.resolve(distDir, 'index.html');
+    app.use(
+      express.static(distDir, {
+        setHeaders: (res, filePath) => {
+          const base = path.basename(filePath);
+          if (base === 'index.html' || base === 'sw.js' || base === 'registerSW.js') {
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+          }
+        },
+      })
+    );
     app.get('*', (_req, res) => {
-      res.sendFile(path.resolve(distDir, 'index.html'));
+      if (!fs.existsSync(indexHtmlPath)) {
+        res
+          .status(503)
+          .type('text/plain')
+          .send('Application bundle not built yet. Run "npm run build" before starting in production.');
+        return;
+      }
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.sendFile(indexHtmlPath);
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  // Structured error middleware (prevents Express HTML error pages on /api/*)
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+    const errObj = err as { status?: number; type?: string; message?: string } | null;
+    if (errObj?.type === 'entity.parse.failed') {
+      res.status(400).json({ error: 'Invalid JSON request body.' });
+      return;
+    }
+    if (errObj?.type === 'entity.too.large') {
+      res.status(413).json({ error: 'Request payload is too large.' });
+      return;
+    }
+    const status =
+      typeof errObj?.status === 'number' && errObj.status >= 400 && errObj.status < 600
+        ? errObj.status
+        : 500;
+    console.error('Server request error:', err);
+    if (req.path.startsWith('/api')) {
+      res.status(status).json({
+        error: status === 500 ? 'Internal server error.' : errObj?.message || 'Request failed.',
+      });
+      return;
+    }
+    res.status(status).type('text/plain').send('Server error.');
+  });
+
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`FF TUNE server listening on http://0.0.0.0:${PORT}`);
+  });
+  server.on('error', (err) => {
+    console.error('Failed to bind FF TUNE server:', err);
+    process.exit(1);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('Fatal server startup error:', err);
+  process.exit(1);
+});
