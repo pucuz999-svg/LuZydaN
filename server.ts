@@ -53,6 +53,8 @@ interface CustomerRequestRecord {
 
 interface AuthStoreData {
   adminClaim: AdminClaimRecord | null;
+  claimResetRevision?: number;
+  ignoreEnvAdmin?: boolean;
   admins: AdminRecord[];
   customers: CustomerRecord[];
   requests: CustomerRequestRecord[];
@@ -125,6 +127,8 @@ function ensureStore(): AuthStoreData {
   if (!fs.existsSync(STORE_PATH)) {
     const initial: AuthStoreData = {
       adminClaim: null,
+      claimResetRevision: 3,
+      ignoreEnvAdmin: true,
       admins: [],
       customers: [],
       requests: [],
@@ -135,14 +139,28 @@ function ensureStore(): AuthStoreData {
   try {
     const raw = fs.readFileSync(STORE_PATH, 'utf8');
     const parsed = JSON.parse(raw) as Partial<AuthStoreData>;
-    return {
-      adminClaim: parsed.adminClaim ?? null,
+    const needsClaimReset = parsed.claimResetRevision !== 3;
+    const normalized: AuthStoreData = {
+      adminClaim: needsClaimReset ? null : (parsed.adminClaim ?? null),
+      claimResetRevision: 3,
+      ignoreEnvAdmin: needsClaimReset ? true : Boolean(parsed.ignoreEnvAdmin),
       admins: Array.isArray(parsed.admins) ? parsed.admins : [],
       customers: Array.isArray(parsed.customers) ? parsed.customers : [],
       requests: Array.isArray(parsed.requests) ? parsed.requests : [],
     };
+    if (needsClaimReset) {
+      saveStore(normalized);
+    }
+    return normalized;
   } catch {
-    return { adminClaim: null, admins: [], customers: [], requests: [] };
+    return {
+      adminClaim: null,
+      claimResetRevision: 3,
+      ignoreEnvAdmin: true,
+      admins: [],
+      customers: [],
+      requests: [],
+    };
   }
 }
 
@@ -511,6 +529,11 @@ function getEnvAdminConfig(): { adminId: string; passcode: string } | null {
   return { adminId, passcode };
 }
 
+function getEffectiveEnvAdmin(store: AuthStoreData): { adminId: string; passcode: string } | null {
+  if (store.ignoreEnvAdmin) return null;
+  return getEnvAdminConfig();
+}
+
 const SESSION_COOKIE_NAME = 'firetune_session';
 
 function parseCookieValue(cookieHeader: string | undefined, name: string): string | null {
@@ -619,8 +642,8 @@ async function startServer() {
 
   // Auth status: checks if Admin credentials are configured (env, claimed, or named admins)
   app.get('/api/auth/status', (_req, res) => {
-    const envAdmin = getEnvAdminConfig();
     const store = ensureStore();
+    const envAdmin = getEffectiveEnvAdmin(store);
     const adminConfigured = Boolean(
       envAdmin || store.adminClaim || store.admins.some((a) => a.active)
     );
@@ -633,8 +656,8 @@ async function startServer() {
 
   // One-time first-run Admin Claim (locks automatically once claimed or when ADMIN_PASSCODE env is set)
   app.post('/api/auth/admin/claim', (req, res) => {
-    const envAdmin = getEnvAdminConfig();
     const store = ensureStore();
+    const envAdmin = getEffectiveEnvAdmin(store);
 
     if (envAdmin || store.adminClaim) {
       res.status(409).json({
@@ -702,7 +725,7 @@ async function startServer() {
     const store = ensureStore();
 
     if (role === 'admin') {
-      const envAdmin = getEnvAdminConfig();
+      const envAdmin = getEffectiveEnvAdmin(store);
 
       // If envAdmin is configured and the login ID matches envAdmin.adminId, enforce env passcode strictly
       if (
@@ -1306,8 +1329,8 @@ async function startServer() {
       return;
     }
 
-    const envAdmin = getEnvAdminConfig();
     const store = ensureStore();
+    const envAdmin = getEffectiveEnvAdmin(store);
 
     if (
       (envAdmin && envAdmin.adminId.toLowerCase() === customId.toLowerCase()) ||
@@ -1425,7 +1448,7 @@ async function startServer() {
       }
 
       const store = ensureStore();
-      const envAdmin = getEnvAdminConfig();
+      const envAdmin = getEffectiveEnvAdmin(store);
 
       // Signed in as a named Admin account in store.admins
       if (req.authUser?.sub && req.authUser.sub !== 'admin-root') {
@@ -1525,22 +1548,25 @@ async function startServer() {
     '/api/admin/credentials/reset-claim',
     requireAuth,
     requireAdmin,
-    (req, res) => {
-      const envAdmin = getEnvAdminConfig();
-      if (envAdmin) {
-        res.status(409).json({
-          error:
-            'ADMIN_PASSCODE environment secret is set. Remove or edit it in Settings -> Secrets.',
-        });
-        return;
-      }
-
+    (req: AuthenticatedRequest, res) => {
       const currentPassword =
         typeof req.body?.currentPassword === 'string' ? req.body.currentPassword : '';
       const store = ensureStore();
+      const envAdmin = getEffectiveEnvAdmin(store);
 
-      if (
-        store.adminClaim &&
+      if (req.authUser?.sub && req.authUser.sub !== 'admin-root') {
+        const caller = store.admins.find((a) => a.id === req.authUser?.sub);
+        if (!caller || !verifyPasswordHash(currentPassword, caller.passwordHash)) {
+          res.status(401).json({ error: 'Current admin password is required to reset.' });
+          return;
+        }
+      } else if (envAdmin) {
+        if (!safeCompareStrings(currentPassword, envAdmin.passcode)) {
+          res.status(401).json({ error: 'Current admin password is required to reset.' });
+          return;
+        }
+      } else if (
+        !store.adminClaim ||
         !verifyPasswordHash(currentPassword, store.adminClaim.passwordHash)
       ) {
         res.status(401).json({ error: 'Current admin password is required to reset.' });
@@ -1548,6 +1574,7 @@ async function startServer() {
       }
 
       store.adminClaim = null;
+      store.ignoreEnvAdmin = true;
       saveStore(store);
       clearSessionCookie(req, res);
       res.json({ reset: true });
@@ -1679,7 +1706,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`FireTune server listening on http://0.0.0.0:${PORT}`);
+    console.log(`FF TUNE server listening on http://0.0.0.0:${PORT}`);
   });
 }
 

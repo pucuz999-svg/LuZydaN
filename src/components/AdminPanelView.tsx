@@ -597,7 +597,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   const handleCopyCredentials = async () => {
     if (!createdBanner) return;
     const text = [
-      'FireTune User Login',
+      'FF TUNE User Login',
       createdBanner.email ? `Email ID: ${createdBanner.email}` : null,
       `User ID: ${createdBanner.customId}`,
       `Password: ${createdBanner.password}`,

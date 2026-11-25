@@ -468,7 +468,7 @@ export function formatSetupAsText(
   grip: GripType
 ): string {
   return [
-    `FireTune Calibration — ${device.brand} ${device.model}`,
+    `FF TUNE Calibration — ${device.brand} ${device.model}`,
     `Hardware: ${device.ramGb}GB RAM · ${device.refreshHz}Hz · ${device.chipset}`,
     `Profile: ${playstyleName} · Grip: ${grip}`,
     ``,

@@ -20,7 +20,7 @@ export const SavedProfilesView: React.FC<SavedProfilesViewProps> = ({
 
   const handleCopyProfile = async (p: SavedProfile) => {
     const text = [
-      `FireTune Preset: ${p.name}`,
+      `FF TUNE Preset: ${p.name}`,
       `Device: ${p.deviceLabel} (${p.ramGb}GB · ${p.refreshHz}Hz · ${p.os})`,
       `General: ${p.sensitivity.general} | Red Dot: ${p.sensitivity.redDot} | 2x: ${p.sensitivity.scope2x} | 4x: ${p.sensitivity.scope4x} | Sniper: ${p.sensitivity.sniperScope} | Free Look: ${p.sensitivity.freeLook}`,
       `Fire Button: ${p.fireButtonSize}% | ${p.dpiLabel}: ${p.dpiValue} | Graphics: ${p.graphicsDisplay} (${p.highFps} FPS)`,

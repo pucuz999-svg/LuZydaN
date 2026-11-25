@@ -11,6 +11,7 @@ import {
   X,
 } from 'lucide-react';
 import { AdminPanelView } from './components/AdminPanelView';
+import { BrandLogo } from './components/BrandLogo';
 import { CustomDeviceModal } from './components/CustomDeviceModal';
 import { DeviceSensitivityView } from './components/DeviceSensitivityView';
 import { DragHeadshotLab } from './components/DragHeadshotLab';
@@ -429,8 +430,8 @@ export default function App() {
     return (
       <div className="min-h-screen bg-[#0B0E14] text-slate-100 flex items-center justify-center px-4">
         <div className="text-center">
-          <h1 className="text-2xl font-bold tracking-tight text-white">
-            Fire<span className="text-orange-500">Tune</span>
+          <h1 className="flex justify-center">
+            <BrandLogo size="lg" centered />
           </h1>
           <p className="mt-2 text-xs text-slate-400">Loading workspace...</p>
         </div>
@@ -453,9 +454,9 @@ export default function App() {
               e.preventDefault();
               setActiveTab('sensitivity');
             }}
-            className="text-xl font-bold tracking-tight text-white whitespace-nowrap shrink-0"
+            className="inline-flex items-center whitespace-nowrap shrink-0"
           >
-            Fire<span className="text-orange-500">Tune</span>
+            <BrandLogo size="md" />
           </a>
         </div>
 
@@ -532,9 +533,7 @@ export default function App() {
           />
           <aside className="relative z-10 flex w-72 max-w-[85vw] flex-col bg-[#0E121B] border-r border-slate-800">
             <div className="flex h-16 items-center justify-between px-5 border-b border-slate-800">
-              <span className="text-xl font-bold tracking-tight text-white">
-                Fire<span className="text-orange-500">Tune</span>
-              </span>
+              <BrandLogo size="md" />
               <button
                 type="button"
                 onClick={() => setMobileMenuOpen(false)}

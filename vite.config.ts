@@ -21,8 +21,8 @@ export default defineConfig(() => {
         ],
         manifest: {
           id: '/',
-          name: 'FireTune — Free Fire Studio',
-          short_name: 'FireTune',
+          name: 'FF TUNE — Free Fire Studio',
+          short_name: 'FF TUNE',
           description:
             'Optimize Free Fire FPS performance, calibrate 0-200 sensitivity and DPI, and practice drag headshots.',
           theme_color: '#0B0E14',

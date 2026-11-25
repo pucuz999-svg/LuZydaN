@@ -9,6 +9,7 @@ import {
   UserCheck,
 } from 'lucide-react';
 import { AuthStatus, AuthUser, DeviceSpec } from '../types';
+import { BrandLogo } from './BrandLogo';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface LoginViewProps {
@@ -206,8 +207,8 @@ export const LoginView: React.FC<LoginViewProps> = ({
       <div className="mx-auto w-full max-w-md">
         {/* Brand Wordmark */}
         <div className="text-center">
-          <h1 className="text-3xl font-bold tracking-tight text-white">
-            Fire<span className="text-orange-500">Tune</span>
+          <h1 className="flex justify-center">
+            <BrandLogo size="lg" centered />
           </h1>
           <p className="mt-2 text-sm text-slate-400">
             Free Fire Performance, Sensitivity &amp; Drag Headshot Studio

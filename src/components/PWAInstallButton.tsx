@@ -45,7 +45,7 @@ export const PWAInstallButton: React.FC = () => {
                     id="pwa-install-title"
                     className="text-base font-semibold text-white"
                   >
-                    Install FireTune as an App
+                    Install FF TUNE as an App
                   </h2>
                   <p className="text-xs text-slate-400">
                     Add to your home screen or desktop for offline access
@@ -74,7 +74,7 @@ export const PWAInstallButton: React.FC = () => {
                       Scroll down and tap <strong className="text-white">Add to Home Screen</strong>.
                     </li>
                     <li>
-                      Tap <strong className="text-white">Add</strong> to launch FireTune standalone.
+                      Tap <strong className="text-white">Add</strong> to launch FF TUNE standalone.
                     </li>
                   </ol>
                 </div>

@@ -103,6 +103,8 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -110,6 +112,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -1920,6 +1923,55 @@ private enum class AuthTabMode(val label: String) {
 }
 
 @Composable
+fun BrandLogoMark(large: Boolean = false) {
+  val boxSize = if (large) 44.dp else 30.dp
+  val corner = if (large) 11.dp else 8.dp
+  val textSize = if (large) 28.sp else 18.sp
+
+  Row(
+    verticalAlignment = Alignment.CenterVertically,
+    horizontalArrangement = Arrangement.spacedBy(if (large) 10.dp else 8.dp),
+  ) {
+    Surface(
+      modifier = Modifier.size(boxSize),
+      color = SurfaceElevated,
+      shape = RoundedCornerShape(corner),
+      border = BorderStroke(1.dp, OrangeAccent.copy(alpha = 0.5f)),
+    ) {
+      Canvas(modifier = Modifier.fillMaxSize().padding(if (large) 7.dp else 5.dp)) {
+        val cx = size.width / 2f
+        val cy = size.height / 2f
+        val r = size.minDimension * 0.38f
+        val strokePx = if (large) 4.2f else 3f
+        drawCircle(
+          color = OrangeAccent,
+          radius = r,
+          center = Offset(cx, cy),
+          style = Stroke(width = strokePx),
+        )
+        drawLine(OrangeAccent, Offset(cx, 0f), Offset(cx, size.height * 0.2f), strokeWidth = strokePx, cap = StrokeCap.Round)
+        drawLine(OrangeAccent, Offset(cx, size.height * 0.8f), Offset(cx, size.height), strokeWidth = strokePx, cap = StrokeCap.Round)
+        drawLine(OrangeAccent, Offset(0f, cy), Offset(size.width * 0.2f, cy), strokeWidth = strokePx, cap = StrokeCap.Round)
+        drawLine(OrangeAccent, Offset(size.width * 0.8f, cy), Offset(size.width, cy), strokeWidth = strokePx, cap = StrokeCap.Round)
+        drawCircle(color = TextPrimary, radius = size.minDimension * 0.11f, center = Offset(cx, cy))
+      }
+    }
+    Text(
+      text = buildAnnotatedString {
+        withStyle(SpanStyle(color = TextPrimary, fontWeight = FontWeight.ExtraBold)) {
+          append("FF ")
+        }
+        withStyle(SpanStyle(color = OrangeAccent, fontWeight = FontWeight.ExtraBold)) {
+          append("TUNE")
+        }
+      },
+      fontSize = textSize,
+      letterSpacing = if (large) 2.sp else 1.2.sp,
+    )
+  }
+}
+
+@Composable
 fun AuthGateScreen(
   devices: List<DeviceSpec>,
   adminConfigured: Boolean,
@@ -1962,15 +2014,10 @@ fun AuthGateScreen(
     horizontalAlignment = Alignment.CenterHorizontally,
     verticalArrangement = Arrangement.Center,
   ) {
+    BrandLogoMark(large = true)
+    Spacer(Modifier.height(6.dp))
     Text(
-      text = "FireTune",
-      color = OrangeAccent,
-      fontSize = 30.sp,
-      fontWeight = FontWeight.Bold,
-    )
-    Spacer(Modifier.height(4.dp))
-    Text(
-      text = "Free Fire Sensitivity, DPI & Samsung Calibration Studio",
+      text = "Free Fire Sensitivity, DPI & Calibration Studio",
       color = TextMuted,
       fontSize = 12.sp,
     )
@@ -2401,6 +2448,8 @@ fun AdminAccessScreen(
   devices: List<DeviceSpec>,
   requests: List<LocalAccessRequest>,
   users: List<LocalAuthUser>,
+  currentAdminId: String,
+  isRootAdmin: Boolean,
   onApproveRequest: (String) -> Unit,
   onRejectRequest: (String) -> Unit,
   onCreateUser: (
@@ -2413,6 +2462,12 @@ fun AdminAccessScreen(
   ) -> Pair<String?, String?>,
   onToggleSuspend: (String) -> Unit,
   onDeleteUser: (String) -> Unit,
+  onUpdateAdminCredentials: (
+    currentPassword: String,
+    newAdminId: String,
+    newPassword: String,
+  ) -> Pair<String?, String?>,
+  onResetAdminClaim: (currentPassword: String) -> String?,
   onOpenCalibrationStudio: () -> Unit,
 ) {
   var email by remember { mutableStateOf("") }
@@ -2423,6 +2478,13 @@ fun AdminAccessScreen(
   var selectedRole by remember { mutableStateOf(AuthRole.USER) }
   var showDevicePicker by remember { mutableStateOf(false) }
   var formMsg by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
+
+  var adminCurrentPass by remember { mutableStateOf("") }
+  var newAdminIdInput by remember(currentAdminId) { mutableStateOf(currentAdminId) }
+  var newAdminPass by remember { mutableStateOf("") }
+  var confirmAdminPass by remember { mutableStateOf("") }
+  var confirmResetClaim by remember { mutableStateOf(false) }
+  var adminCredsMsg by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
 
   val pendingCount = requests.count { it.status == RequestStatus.PENDING }
   val assignedDevice = remember(devices, assignedDeviceId) {
@@ -2673,6 +2735,136 @@ fun AdminAccessScreen(
           }
           if (idx < users.lastIndex) {
             HorizontalDivider(color = BorderSlate.copy(alpha = 0.6f))
+          }
+        }
+      }
+    }
+
+    // Reset Admin Claim ID & Password
+    PanelCard {
+      Text("Reset Admin Claim ID & Password", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+      Spacer(Modifier.height(4.dp))
+      Text(
+        "Update your Admin ID and password, or reset back to First-Run Setup.",
+        color = TextMuted,
+        fontSize = 11.sp,
+      )
+      Spacer(Modifier.height(8.dp))
+      if (adminCredsMsg != null) {
+        val (isOk, msg) = adminCredsMsg!!
+        Surface(
+          modifier = Modifier.fillMaxWidth(),
+          color = (if (isOk) EmeraldAccent else RoseAccent).copy(alpha = 0.14f),
+          shape = RoundedCornerShape(8.dp),
+        ) {
+          Text(msg, color = if (isOk) EmeraldAccent else RoseAccent, fontSize = 12.sp, modifier = Modifier.padding(10.dp))
+        }
+        Spacer(Modifier.height(8.dp))
+      }
+      OutlinedTextField(
+        value = adminCurrentPass,
+        onValueChange = { adminCurrentPass = it },
+        label = { Text("Current Admin Password", fontSize = 12.sp) },
+        visualTransformation = PasswordVisualTransformation(),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth(),
+      )
+      Spacer(Modifier.height(8.dp))
+      OutlinedTextField(
+        value = newAdminIdInput,
+        onValueChange = { newAdminIdInput = it },
+        label = { Text("New Admin ID", fontSize = 12.sp) },
+        placeholder = { Text("e.g. admin", fontSize = 12.sp) },
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth(),
+      )
+      Spacer(Modifier.height(8.dp))
+      Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedTextField(
+          value = newAdminPass,
+          onValueChange = { newAdminPass = it },
+          label = { Text("New Password (6+)", fontSize = 12.sp) },
+          visualTransformation = PasswordVisualTransformation(),
+          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+          singleLine = true,
+          modifier = Modifier.weight(1f),
+        )
+        OutlinedTextField(
+          value = confirmAdminPass,
+          onValueChange = { confirmAdminPass = it },
+          label = { Text("Confirm Password", fontSize = 12.sp) },
+          visualTransformation = PasswordVisualTransformation(),
+          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+          singleLine = true,
+          modifier = Modifier.weight(1f),
+        )
+      }
+      Spacer(Modifier.height(10.dp))
+      Button(
+        onClick = {
+          if (newAdminPass != confirmAdminPass) {
+            adminCredsMsg = false to "New admin passwords do not match."
+          } else {
+            val (err, ok) = onUpdateAdminCredentials(adminCurrentPass, newAdminIdInput.trim(), newAdminPass)
+            if (err != null) {
+              adminCredsMsg = false to err
+            } else {
+              adminCredsMsg = true to (ok ?: "Admin credentials updated.")
+              adminCurrentPass = ""
+              newAdminPass = ""
+              confirmAdminPass = ""
+            }
+          }
+        },
+        modifier = Modifier.fillMaxWidth(),
+        colors = ButtonDefaults.buttonColors(containerColor = OrangeAccent, contentColor = BgObsidian),
+      ) {
+        Text("Save New Admin ID & Password", fontWeight = FontWeight.SemiBold)
+      }
+
+      if (isRootAdmin) {
+        Spacer(Modifier.height(10.dp))
+        HorizontalDivider(color = BorderSlate.copy(alpha = 0.6f))
+        Spacer(Modifier.height(10.dp))
+        if (!confirmResetClaim) {
+          OutlinedButton(
+            onClick = {
+              confirmResetClaim = true
+              adminCredsMsg = null
+            },
+            modifier = Modifier.fillMaxWidth(),
+            border = BorderStroke(1.dp, RoseAccent.copy(alpha = 0.55f)),
+          ) {
+            Text("Reset Claim to First-Run Setup", color = RoseAccent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+          }
+        } else {
+          Text(
+            "Enter current password above and confirm to wipe claimed Admin ID & return to First-Run Setup.",
+            color = RoseAccent,
+            fontSize = 11.sp,
+          )
+          Spacer(Modifier.height(6.dp))
+          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+              onClick = {
+                val err = onResetAdminClaim(adminCurrentPass)
+                if (err != null) {
+                  adminCredsMsg = false to err
+                }
+              },
+              modifier = Modifier.weight(1f),
+              colors = ButtonDefaults.buttonColors(containerColor = RoseAccent, contentColor = TextPrimary),
+            ) {
+              Text("Confirm Reset", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            }
+            OutlinedButton(
+              onClick = { confirmResetClaim = false },
+              modifier = Modifier.weight(1f),
+              border = BorderStroke(1.dp, BorderSlate),
+            ) {
+              Text("Cancel", color = TextMuted, fontSize = 12.sp)
+            }
           }
         }
       }

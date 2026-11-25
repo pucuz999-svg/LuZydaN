@@ -204,7 +204,7 @@ export const PerformanceBoosterView: React.FC<PerformanceBoosterViewProps> = ({
 
   const handleCopyBatterySettings = async () => {
     const lines = [
-      `FireTune Android Battery & Resource Profile (${device.brand} ${device.model})`,
+      `FF TUNE Android Battery & Resource Profile (${device.brand} ${device.model})`,
       ...batteryResourceSettings.map(
         (item) => `- ${item.label}: ${item.recommended}\n  Path: ${item.path}`
       ),
@@ -228,7 +228,7 @@ export const PerformanceBoosterView: React.FC<PerformanceBoosterViewProps> = ({
       notificationBlock.muteInAppAlerts ? 'Mute In-App Alerts: ON' : 'Mute In-App Alerts: OFF',
     ];
     const text = [
-      `FireTune Notification Block Profile (${device.brand} ${device.model})`,
+      `FF TUNE Notification Block Profile (${device.brand} ${device.model})`,
       `Master Status: ${notificationBlock.enabled ? 'ACTIVE' : 'OFF'}`,
       ...rules.map((r) => `- ${r}`),
       device.os === 'Android'
@@ -583,7 +583,7 @@ export const PerformanceBoosterView: React.FC<PerformanceBoosterViewProps> = ({
               {
                 key: 'muteInAppAlerts',
                 title: 'Silence In-App Alerts',
-                desc: 'Keeps FireTune prompts quiet once settings are applied before launch.',
+                desc: 'Keeps FF TUNE prompts quiet once settings are applied before launch.',
               },
             ] as const
           ).map((item) => {

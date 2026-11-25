@@ -2358,7 +2358,7 @@ fun formatSetupAsText(
   grip: GripType,
 ): String {
   return buildString {
-    appendLine("FireTune Calibration — ${device.brand} ${device.model}")
+    appendLine("FF TUNE Calibration — ${device.brand} ${device.model}")
     appendLine("Hardware: ${device.ramGb}GB RAM · ${device.refreshHz}Hz · ${device.chipset}")
     appendLine("Profile: ${playstyle.title} · Grip: ${grip.label}")
     appendLine()

@@ -7,6 +7,19 @@ import org.json.JSONObject
 class FireTuneStorage(context: Context) {
   private val prefs = context.getSharedPreferences("firetune_prefs_v1", Context.MODE_PRIVATE)
 
+  init {
+    if (!prefs.getBoolean("admin_claim_reset_v2", false)) {
+      val sid = prefs.getString("local_session_user_id", null)
+      val editor = prefs.edit()
+        .remove("local_admin_config")
+        .putBoolean("admin_claim_reset_v2", true)
+      if (sid == "root-admin") {
+        editor.remove("local_session_user_id")
+      }
+      editor.apply()
+    }
+  }
+
   fun loadCustomDevices(): List<DeviceSpec> {
     val raw = prefs.getString("custom_devices", null) ?: return emptyList()
     return runCatching {
@@ -204,6 +217,10 @@ class FireTuneStorage(context: Context) {
     o.put("passwordHash", config.passwordHash)
     o.put("passwordSalt", config.passwordSalt)
     prefs.edit().putString("local_admin_config", o.toString()).apply()
+  }
+
+  fun clearAdminConfig() {
+    prefs.edit().remove("local_admin_config").apply()
   }
 
   fun loadAuthUsers(): List<LocalAuthUser> {

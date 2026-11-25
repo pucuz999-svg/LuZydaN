@@ -51,10 +51,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.ui.theme.BgObsidian
@@ -295,7 +292,7 @@ fun FireTuneApp() {
 
   fun copyToClipboard(text: String, message: String) {
     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-    cm?.setPrimaryClip(ClipData.newPlainText("FireTune Setup", text))
+    cm?.setPrimaryClip(ClipData.newPlainText("FF TUNE Setup", text))
     scope.launch { snackbarHostState.showSnackbar(message) }
   }
 
@@ -339,17 +336,7 @@ fun FireTuneApp() {
             verticalAlignment = Alignment.CenterVertically,
           ) {
             androidx.compose.foundation.layout.Column(modifier = Modifier.weight(1f)) {
-              Text(
-                text = buildAnnotatedString {
-                  withStyle(SpanStyle(color = TextPrimary, fontWeight = FontWeight.Bold)) {
-                    append("Fire")
-                  }
-                  withStyle(SpanStyle(color = OrangeAccent, fontWeight = FontWeight.Bold)) {
-                    append("Tune")
-                  }
-                },
-                fontSize = 20.sp,
-              )
+              BrandLogoMark(large = false)
               Text(
                 text = if (activeAuthUser.role == AuthRole.ADMIN) "Admin · ${activeAuthUser.customId}" else activeAuthUser.email.ifBlank { activeAuthUser.customId },
                 color = TextMuted,
@@ -386,7 +373,7 @@ fun FireTuneApp() {
                     grip,
                   )
                   val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                  cm?.setPrimaryClip(ClipData.newPlainText("FireTune Setup", summary))
+                  cm?.setPrimaryClip(ClipData.newPlainText("FF TUNE Setup", summary))
                   showLaunchModal = true
                 },
                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
@@ -528,7 +515,7 @@ fun FireTuneApp() {
           },
           onCopyDndGuide = {
             val guide = buildString {
-              appendLine("FireTune Notification Block (${selectedDevice.brand} ${selectedDevice.model})")
+              appendLine("FF TUNE Notification Block (${selectedDevice.brand} ${selectedDevice.model})")
               appendLine("Heads-Up Banners: ${if (notificationBlock.blockHeadsUp) "BLOCKED" else "ALLOW"}")
               appendLine("Incoming Calls: ${if (notificationBlock.blockCalls) "BLOCKED" else "ALLOW"}")
               appendLine("Floating Bubbles: ${if (notificationBlock.blockFloatingBubbles) "BLOCKED" else "ALLOW"}")
@@ -586,6 +573,8 @@ fun FireTuneApp() {
           devices = allDevices,
           requests = accessRequests,
           users = authUsers,
+          currentAdminId = activeAuthUser.customId,
+          isRootAdmin = activeAuthUser.id == "root-admin",
           onApproveRequest = { reqId ->
             val req = accessRequests.find { it.id == reqId } ?: return@AdminAccessScreen
             val nowStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
@@ -668,6 +657,52 @@ fun FireTuneApp() {
             val nextUsers = authUsers.filterNot { it.id == userId }
             authUsers = nextUsers
             storage.saveAuthUsers(nextUsers)
+          },
+          onUpdateAdminCredentials = { currentPw, nextAdminId, nextPw ->
+            val cleanId = nextAdminId.trim().lowercase()
+            if (cleanId.length < 2) {
+              return@AdminAccessScreen "Admin ID must be at least 2 characters." to null
+            }
+            if (nextPw.length < 6) {
+              return@AdminAccessScreen "New admin password must be at least 6 characters." to null
+            }
+            if (activeAuthUser.id == "root-admin") {
+              val rootCfg = adminConfig ?: return@AdminAccessScreen "No claimed admin credentials exist yet." to null
+              if (!LocalAuthCrypto.verifyPassword(currentPw, rootCfg.passwordSalt, rootCfg.passwordHash)) {
+                return@AdminAccessScreen "Current admin password is incorrect." to null
+              }
+              val salt = LocalAuthCrypto.generateSalt()
+              val hash = LocalAuthCrypto.hashPassword(nextPw, salt)
+              val updated = LocalAdminConfig(cleanId, hash, salt)
+              adminConfig = updated
+              storage.saveAdminConfig(updated)
+              null to "Admin credentials updated for @$cleanId."
+            } else {
+              val target = authUsers.find { it.id == activeAuthUser.id }
+                ?: return@AdminAccessScreen "Admin account not found." to null
+              if (!LocalAuthCrypto.verifyPassword(currentPw, target.passwordSalt, target.passwordHash)) {
+                return@AdminAccessScreen "Current admin password is incorrect." to null
+              }
+              val salt = LocalAuthCrypto.generateSalt()
+              val hash = LocalAuthCrypto.hashPassword(nextPw, salt)
+              val nextUsers = authUsers.map {
+                if (it.id == target.id) it.copy(customId = cleanId, passwordHash = hash, passwordSalt = salt) else it
+              }
+              authUsers = nextUsers
+              storage.saveAuthUsers(nextUsers)
+              null to "Admin credentials updated for @$cleanId."
+            }
+          },
+          onResetAdminClaim = { currentPw ->
+            val rootCfg = adminConfig ?: return@AdminAccessScreen "No claimed admin credentials exist yet."
+            if (!LocalAuthCrypto.verifyPassword(currentPw, rootCfg.passwordSalt, rootCfg.passwordHash)) {
+              return@AdminAccessScreen "Current admin password is required to reset."
+            }
+            storage.clearAdminConfig()
+            storage.saveSessionUserId(null)
+            adminConfig = null
+            sessionUserId = null
+            null
           },
           onOpenCalibrationStudio = { activeTab = FireTuneTab.SENSITIVITY },
         )
