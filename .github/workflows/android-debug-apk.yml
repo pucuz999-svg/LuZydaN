@@ -77,7 +77,8 @@ jobs:
             --stacktrace
             -Pkotlin.compiler.execution.strategy=in-process
           )
-          if [ -x ./gradlew ]; then
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew || true
             ./gradlew "${GRADLE_ARGS[@]}" 2>&1 | tee gradle-build.log
           else
             gradle "${GRADLE_ARGS[@]}" 2>&1 | tee gradle-build.log
