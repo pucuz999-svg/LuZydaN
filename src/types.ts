@@ -155,5 +155,42 @@ export interface CatalogOverrides {
   removedIds: string[];
 }
 
+export type UserApprovalStatus = 'pending' | 'approved' | 'blocked';
 
+export type UserActionType =
+  | 'signup'
+  | 'login'
+  | 'logout'
+  | 'view_tab'
+  | 'select_device'
+  | 'update_sensitivity'
+  | 'save_preset'
+  | 'delete_preset'
+  | 'apply_launch'
+  | 'toggle_optimization'
+  | 'practice_drag'
+  | 'admin_approve_user'
+  | 'admin_block_user';
 
+export interface FirebaseUserProfile {
+  uid: string;
+  email: string;
+  displayName: string;
+  photoURL: string;
+  status: UserApprovalStatus;
+  role: UserRole | 'user';
+  requestedDeviceId: string;
+  createdAt: string | null;
+  lastLoginAt: string | null;
+  updatedAt: string | null;
+}
+
+export interface ActivityLogEntry {
+  id: string;
+  userId: string;
+  userEmail: string;
+  userDisplayName: string;
+  action: UserActionType;
+  details: string;
+  createdAt: string | null;
+}

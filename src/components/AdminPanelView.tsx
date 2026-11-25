@@ -1,48 +1,67 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
+  Activity,
   Check,
-  Copy,
-  Inbox,
-  KeyRound,
+  ChevronDown,
+  ChevronUp,
+  Clock,
   Pencil,
   Plus,
-  RefreshCw,
   RotateCcw,
   Search,
-  Shield,
   ShieldCheck,
+  ShieldOff,
   SlidersHorizontal,
   Trash2,
   Upload,
-  UserX,
+  Users,
   X,
 } from 'lucide-react';
 import {
-  AdminAccount,
-  AuthUser,
+  collection,
+  deleteDoc,
+  doc,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+  writeBatch,
+} from 'firebase/firestore';
+import type { User } from 'firebase/auth';
+import {
+  ADMIN_EMAIL,
+  db,
+  formatTimestampToIso,
+  handleFirestoreError,
+  logUserAction,
+  mapUserDoc,
+  OperationType,
+} from '../firebase';
+import {
+  ActivityLogEntry,
   CatalogOverrides,
-  CustomerAccount,
-  CustomerRequest,
   DeviceSpec,
   DeviceTier,
+  FirebaseUserProfile,
   OperatingSystem,
-  RequestStatus,
+  UserActionType,
+  UserApprovalStatus,
 } from '../types';
 import { DEVICE_CATALOG } from '../utils/devices';
 
 interface AdminPanelViewProps {
-  token: string;
-  currentAdminId: string;
-  currentUserId: string;
+  currentUser: User;
   devices: DeviceSpec[];
   masterDevices: DeviceSpec[];
   catalogOverrides: CatalogOverrides;
-  onCatalogOverridesChange: (next: CatalogOverrides) => void;
-  onAdminCredentialsUpdated: (token: string, user: AuthUser) => void;
-  onResetAdminClaim: () => void;
   onPendingCountChange?: (count: number) => void;
 }
 
+type AdminSectionTab = 'users' | 'activity' | 'catalog';
+type UserStatusFilter = 'all' | UserApprovalStatus;
 type CatalogBrandFilter = 'all' | 'samsung' | 'xiaomi' | 'motorola' | 'vivo' | 'other';
 
 interface DeviceFormState {
@@ -119,55 +138,120 @@ function deviceToFormState(device: DeviceSpec): DeviceFormState {
   };
 }
 
+function sanitizeFirestoreDeviceId(raw: string, brand: string, model: string): string {
+  const base = (raw.trim() || `${brand}-${model}`)
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+  return base.length >= 2 ? base : `device-${Date.now()}`;
+}
+
+function clampInt(val: unknown, min: number, max: number, fallback: number): number {
+  const num = typeof val === 'number' ? val : Number(val);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(num)));
+}
+
+function clampFloat(val: unknown, min: number, max: number, fallback: number): number {
+  const num = typeof val === 'number' ? val : Number(val);
+  if (!Number.isFinite(num)) return fallback;
+  const clamped = Math.max(min, Math.min(max, num));
+  return Math.round(clamped * 100) / 100;
+}
+
+const VALID_TIERS = new Set<DeviceTier>(['low', 'mid', 'high', 'gaming', 'ios']);
+const VALID_OS = new Set<OperatingSystem>(['Android', 'iOS']);
+const VALID_THERMAL = new Set<'Tight' | 'Moderate' | 'High'>(['Tight', 'Moderate', 'High']);
+
+function buildCatalogDocPayload(
+  input: Partial<DeviceSpec>,
+  adminUid: string,
+  removed: boolean
+): Record<string, unknown> {
+  const brand = (input.brand || 'Custom').trim().slice(0, 40) || 'Custom';
+  const model = (input.model || 'Device').trim().slice(0, 80) || 'Device';
+  const id = sanitizeFirestoreDeviceId(input.id || '', brand, model);
+  const ramGb = clampInt(input.ramGb, 1, 32, 8);
+  const os: OperatingSystem =
+    input.os && VALID_OS.has(input.os)
+      ? input.os
+      : brand.toLowerCase() === 'apple'
+        ? 'iOS'
+        : 'Android';
+  const tier: DeviceTier =
+    input.tier && VALID_TIERS.has(input.tier)
+      ? input.tier
+      : os === 'iOS'
+        ? 'ios'
+        : ramGb <= 3
+          ? 'low'
+          : ramGb <= 6
+            ? 'mid'
+            : 'high';
+  const refreshHz = clampInt(input.refreshHz, 30, 240, 120);
+  const touchSamplingHz = clampInt(
+    input.touchSamplingHz,
+    60,
+    1000,
+    refreshHz >= 120 ? 240 : 120
+  );
+  const ppi = clampInt(input.ppi, 120, 700, 400);
+  const screenInches = clampFloat(input.screenInches, 4, 15, 6.67);
+  const chipset =
+    (input.chipset || '').trim().slice(0, 80) ||
+    (os === 'iOS' ? 'Apple Silicon' : 'Snapdragon / Dimensity');
+  const defaultDpi = clampInt(input.defaultDpi, 100, 600, os === 'iOS' ? 114 : 392);
+  const recommendedDpi = clampInt(input.recommendedDpi, 100, 650, os === 'iOS' ? 120 : 510);
+  const thermalHeadroom: 'Tight' | 'Moderate' | 'High' =
+    input.thermalHeadroom && VALID_THERMAL.has(input.thermalHeadroom)
+      ? input.thermalHeadroom
+      : ramGb <= 3
+        ? 'Tight'
+        : ramGb >= 8
+          ? 'High'
+          : 'Moderate';
+
+  const payload: Record<string, unknown> = {
+    id,
+    brand,
+    model,
+    tier,
+    os,
+    ramGb,
+    refreshHz,
+    touchSamplingHz,
+    ppi,
+    screenInches,
+    chipset,
+    defaultDpi,
+    recommendedDpi,
+    thermalHeadroom,
+    removed,
+    updatedBy: adminUid,
+    updatedAt: serverTimestamp(),
+  };
+
+  if (input.presetSensitivity) {
+    payload.presetSensitivity = {
+      general: clampInt(input.presetSensitivity.general, 0, 200, 184),
+      redDot: clampInt(input.presetSensitivity.redDot, 0, 200, 173),
+      scope2x: clampInt(input.presetSensitivity.scope2x, 0, 200, 155),
+      scope4x: clampInt(input.presetSensitivity.scope4x, 0, 200, 137),
+      sniperScope: clampInt(input.presetSensitivity.sniperScope, 0, 200, 89),
+      freeLook: clampInt(input.presetSensitivity.freeLook, 0, 200, 161),
+    };
+  }
+  if (input.presetFireButton !== undefined) {
+    payload.presetFireButton = clampInt(input.presetFireButton, 32, 70, 46);
+  }
+  return payload;
+}
+
 const SAMPLE_CSV_BULK = `brand,model,ramGb,refreshHz,chipset,general,redDot,scope2x,scope4x,sniperScope,freeLook,fireButton,recommendedDpi
 Xiaomi,Redmi Note 14 Pro 5G,8,120,Dimensity 7300-Ultra,182,171,153,136,88,159,46,520
 Motorola,Moto Edge 50 Neo,8,120,Dimensity 7300,183,172,154,137,88,160,46,520
 Vivo,Vivo V50 5G,8,120,Snapdragon 7 Gen 3,182,171,154,136,88,160,46,525`;
-
-const SAMPLE_JSON_BULK = JSON.stringify(
-  [
-    {
-      brand: 'Xiaomi',
-      model: 'Redmi Note 14 Pro+ 5G',
-      ramGb: 12,
-      refreshHz: 120,
-      touchSamplingHz: 240,
-      chipset: 'Snapdragon 7s Gen 3',
-      recommendedDpi: 525,
-      thermalHeadroom: 'High',
-      presetSensitivity: {
-        general: 180,
-        redDot: 169,
-        scope2x: 152,
-        scope4x: 135,
-        sniperScope: 88,
-        freeLook: 158,
-      },
-      presetFireButton: 45,
-    },
-    {
-      brand: 'Vivo',
-      model: 'Vivo T4x 5G',
-      ramGb: 6,
-      refreshHz: 120,
-      touchSamplingHz: 240,
-      chipset: 'Dimensity 7300',
-      recommendedDpi: 505,
-      thermalHeadroom: 'Moderate',
-      presetSensitivity: {
-        general: 185,
-        redDot: 175,
-        scope2x: 156,
-        scope4x: 138,
-        sniperScope: 90,
-        freeLook: 162,
-      },
-      presetFireButton: 47,
-    },
-  ],
-  null,
-  2
-);
 
 function parseBulkDevicesInput(
   rawText: string
@@ -203,7 +287,8 @@ function parseBulkDevicesInput(
     return { ok: false, error: 'No device rows detected.' };
   }
 
-  const headerFirst = lines[0].toLowerCase().includes('brand') && lines[0].toLowerCase().includes('model');
+  const headerFirst =
+    lines[0].toLowerCase().includes('brand') && lines[0].toLowerCase().includes('model');
   const dataLines = headerFirst ? lines.slice(1) : lines;
   if (dataLines.length === 0) {
     return { ok: false, error: 'Header found without any device rows underneath.' };
@@ -250,9 +335,18 @@ function parseBulkDevicesInput(
     if (
       !brand ||
       !model ||
-      [ramGb, refreshHz, general, redDot, scope2x, scope4x, sniperScope, freeLook, fireButton, recommendedDpi].some(
-        (n) => !Number.isFinite(n)
-      )
+      [
+        ramGb,
+        refreshHz,
+        general,
+        redDot,
+        scope2x,
+        scope4x,
+        sniperScope,
+        freeLook,
+        fireButton,
+        recommendedDpi,
+      ].some((n) => !Number.isFinite(n))
     ) {
       return {
         ok: false,
@@ -294,66 +388,75 @@ function parseBulkDevicesInput(
   return { ok: true, devices: out };
 }
 
+function formatRelativeTime(iso: string | null): string {
+  if (!iso) return 'Never';
+  const diffMs = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(diffMs) || diffMs < 0) return 'Just now';
+  const sec = Math.floor(diffMs / 1000);
+  if (sec < 60) return 'Just now';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hrs = Math.floor(min / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ago`;
+}
+
+function formatActionLabel(action: UserActionType): string {
+  switch (action) {
+    case 'signup':
+      return 'Signed Up';
+    case 'login':
+      return 'Logged In';
+    case 'logout':
+      return 'Signed Out';
+    case 'view_tab':
+      return 'Opened Section';
+    case 'select_device':
+      return 'Selected Device';
+    case 'update_sensitivity':
+      return 'Adjusted Sensitivity';
+    case 'save_preset':
+      return 'Saved Preset';
+    case 'delete_preset':
+      return 'Deleted Preset';
+    case 'apply_launch':
+      return 'Applied & Launched';
+    case 'toggle_optimization':
+      return 'Toggled FPS Step';
+    case 'practice_drag':
+      return 'Drag Lab Practice';
+    case 'admin_approve_user':
+      return 'Admin Approved';
+    case 'admin_block_user':
+      return 'Admin Blocked';
+    default:
+      return action;
+  }
+}
+
 export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
-  token,
-  currentAdminId,
-  currentUserId,
+  currentUser,
   devices,
   masterDevices,
   catalogOverrides,
-  onCatalogOverridesChange,
-  onAdminCredentialsUpdated,
-  onResetAdminClaim,
   onPendingCountChange,
 }) => {
-  const [envOverrideActive, setEnvOverrideActive] = useState(false);
-  const [customers, setCustomers] = useState<CustomerAccount[]>([]);
-  const [admins, setAdmins] = useState<AdminAccount[]>([]);
-  const [requests, setRequests] = useState<CustomerRequest[]>([]);
-  const [requestFilter, setRequestFilter] = useState<'all' | RequestStatus>('pending');
-  const [rejectingId, setRejectingId] = useState<string | null>(null);
-  const [rejectionReason, setRejectionReason] = useState('');
-
+  const [sectionTab, setSectionTab] = useState<AdminSectionTab>('users');
+  const [users, setUsers] = useState<FirebaseUserProfile[]>([]);
+  const [logs, setLogs] = useState<ActivityLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
-  const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [banner, setBanner] = useState<string | null>(null);
 
-  // Create customer form state
-  const [customerEmail, setCustomerEmail] = useState('');
-  const [customId, setCustomId] = useState('');
-  const [displayName, setDisplayName] = useState('');
-  const [password, setPassword] = useState('');
-  const [assignedDeviceId, setAssignedDeviceId] = useState('samsung-a54');
-  const [creating, setCreating] = useState(false);
-  const [createdBanner, setCreatedBanner] = useState<{
-    customId: string;
-    email?: string;
-    password: string;
-  } | null>(null);
-  const [copiedCreds, setCopiedCreds] = useState(false);
+  const [userSearch, setUserSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState<UserStatusFilter>('all');
+  const [expandedUserIds, setExpandedUserIds] = useState<Record<string, boolean>>({});
+  const [updatingUid, setUpdatingUid] = useState<string | null>(null);
 
-  // Create full-access Admin form state
-  const [newAdmAccountId, setNewAdmAccountId] = useState('');
-  const [newAdmAccountName, setNewAdmAccountName] = useState('');
-  const [newAdmAccountPass, setNewAdmAccountPass] = useState('');
-  const [creatingAdmin, setCreatingAdmin] = useState(false);
-  const [adminCreatedBanner, setAdminCreatedBanner] = useState<string | null>(null);
+  const [activitySearch, setActivitySearch] = useState('');
 
-  // Inline password reset state
-  const [resetTargetId, setResetTargetId] = useState<string | null>(null);
-  const [resetPasswordVal, setResetPasswordVal] = useState('');
-
-  // Admin ID & password reset state
-  const [adminCurrentPass, setAdminCurrentPass] = useState('');
-  const [newAdminId, setNewAdminId] = useState(currentAdminId);
-  const [newAdminPass, setNewAdminPass] = useState('');
-  const [confirmAdminPass, setConfirmAdminPass] = useState('');
-  const [adminSaving, setAdminSaving] = useState(false);
-  const [adminSuccess, setAdminSuccess] = useState<string | null>(null);
-  const [confirmResetClaim, setConfirmResetClaim] = useState(false);
-
-  // Master Device Sensitivity Catalog management state
+  // Master Device Sensitivity Catalog state
   const [catalogSearch, setCatalogSearch] = useState('');
   const [catalogBrandFilter, setCatalogBrandFilter] = useState<CatalogBrandFilter>('all');
   const [catalogShowAll, setCatalogShowAll] = useState(false);
@@ -363,537 +466,232 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   const [bulkPanelOpen, setBulkPanelOpen] = useState(false);
   const [bulkInput, setBulkInput] = useState('');
   const [catalogSaving, setCatalogSaving] = useState(false);
-  const [catalogBanner, setCatalogBanner] = useState<string | null>(null);
 
-  const fetchAdminData = useCallback(
-    async (silent = false) => {
-      if (silent) {
-        setSyncing(true);
-      } else {
-        setLoading(true);
-        setError(null);
-      }
-      try {
-        const [custRes, reqRes, admRes, statusRes] = await Promise.all([
-          fetch('/api/admin/customers', {
-            headers: { Authorization: `Bearer ${token}` },
-            cache: 'no-store',
-          }),
-          fetch('/api/admin/requests', {
-            headers: { Authorization: `Bearer ${token}` },
-            cache: 'no-store',
-          }),
-          fetch('/api/admin/admins', {
-            headers: { Authorization: `Bearer ${token}` },
-            cache: 'no-store',
-          }),
-          fetch('/api/auth/status', { cache: 'no-store' }),
-        ]);
-
-        if (custRes.status === 401 || reqRes.status === 401 || admRes.status === 401) {
-          onResetAdminClaim();
-          return;
-        }
-
-        const custData = await custRes.json();
-        const reqData = await reqRes.json();
-        const admData = await admRes.json();
-        if (statusRes.ok) {
-          const statusData = await statusRes.json();
-          setEnvOverrideActive(Boolean(statusData?.envOverrideActive));
-        }
-
-        if (!custRes.ok) {
-          if (!silent) setError(custData?.error || 'Could not load customer accounts.');
-          return;
-        }
-        if (!reqRes.ok) {
-          if (!silent) setError(reqData?.error || 'Could not load customer requests.');
-          return;
-        }
-        if (!admRes.ok) {
-          if (!silent) setError(admData?.error || 'Could not load admin accounts.');
-          return;
-        }
-
-        const nextReqs = (reqData.requests || []) as CustomerRequest[];
-        setCustomers(custData.customers || []);
-        setRequests(nextReqs);
-        setAdmins(admData.admins || []);
-        setLastSyncedAt(new Date().toLocaleTimeString());
-        onPendingCountChange?.(nextReqs.filter((r) => r.status === 'pending').length);
-      } catch {
-        if (!silent) setError('Failed to reach server.');
-      } finally {
+  // Real-time Firestore listener: all users
+  useEffect(() => {
+    const usersQuery = query(collection(db, 'users'), orderBy('lastLoginAt', 'desc'));
+    const unsubscribe = onSnapshot(
+      usersQuery,
+      (snapshot) => {
+        const list = snapshot.docs.map((d) =>
+          mapUserDoc(d.id, d.data() as Record<string, unknown>)
+        );
+        setUsers(list);
         setLoading(false);
-        setSyncing(false);
+        const pendingCount = list.filter((u) => u.status === 'pending').length;
+        onPendingCountChange?.(pendingCount);
+      },
+      (err) => {
+        setLoading(false);
+        handleFirestoreError(err, OperationType.LIST, 'users');
       }
-    },
-    [token, onResetAdminClaim, onPendingCountChange]
-  );
+    );
+    return () => unsubscribe();
+  }, [onPendingCountChange]);
 
+  // Real-time Firestore listener: user & admin actions
   useEffect(() => {
-    fetchAdminData(false);
-    const pollId = window.setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        fetchAdminData(true);
+    const logsQuery = query(
+      collection(db, 'activityLogs'),
+      orderBy('createdAt', 'desc'),
+      limit(250)
+    );
+    const unsubscribe = onSnapshot(
+      logsQuery,
+      (snapshot) => {
+        const entries: ActivityLogEntry[] = snapshot.docs.map((d) => {
+          const data = d.data() as Record<string, unknown>;
+          return {
+            id: d.id,
+            userId: typeof data.userId === 'string' ? data.userId : '',
+            userEmail: typeof data.userEmail === 'string' ? data.userEmail : '',
+            userDisplayName:
+              typeof data.userDisplayName === 'string' ? data.userDisplayName : 'User',
+            action: (typeof data.action === 'string'
+              ? data.action
+              : 'login') as UserActionType,
+            details: typeof data.details === 'string' ? data.details : '',
+            createdAt: formatTimestampToIso(data.createdAt),
+          };
+        });
+        setLogs(entries);
+      },
+      (err) => {
+        handleFirestoreError(err, OperationType.LIST, 'activityLogs');
       }
-    }, 5000);
-    const handleFocus = () => {
-      fetchAdminData(true);
-    };
-    const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
-        fetchAdminData(true);
+    );
+    return () => unsubscribe();
+  }, []);
+
+  const logsByUserId = useMemo(() => {
+    const map: Record<string, ActivityLogEntry[]> = {};
+    for (const entry of logs) {
+      if (!map[entry.userId]) {
+        map[entry.userId] = [];
       }
-    };
-    window.addEventListener('focus', handleFocus);
-    document.addEventListener('visibilitychange', handleVisibility);
-    return () => {
-      window.clearInterval(pollId);
-      window.removeEventListener('focus', handleFocus);
-      document.removeEventListener('visibilitychange', handleVisibility);
-    };
-  }, [fetchAdminData]);
-
-  const pendingCount = useMemo(
-    () => requests.filter((r) => r.status === 'pending').length,
-    [requests]
-  );
-
-  useEffect(() => {
-    onPendingCountChange?.(pendingCount);
-  }, [pendingCount, onPendingCountChange]);
-
-  const filteredRequests = useMemo(() => {
-    if (requestFilter === 'all') return requests;
-    return requests.filter((r) => r.status === requestFilter);
-  }, [requests, requestFilter]);
-
-  const generatePassword = () => {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
-    const arr = new Uint32Array(10);
-    crypto.getRandomValues(arr);
-    let out = '';
-    for (let i = 0; i < arr.length; i++) {
-      out += chars[arr[i] % chars.length];
+      map[entry.userId].push(entry);
     }
-    setPassword(out);
-  };
+    return map;
+  }, [logs]);
 
-  const handleDecision = async (
-    requestId: string,
-    decision: 'accept' | 'reject',
-    reason?: string
+  const counts = useMemo(() => {
+    let pending = 0;
+    let approved = 0;
+    let blocked = 0;
+    for (const u of users) {
+      if (u.status === 'pending') pending++;
+      else if (u.status === 'approved') approved++;
+      else if (u.status === 'blocked') blocked++;
+    }
+    return {
+      total: users.length,
+      pending,
+      approved,
+      blocked,
+      logs: logs.length,
+    };
+  }, [users, logs.length]);
+
+  const filteredUsers = useMemo(() => {
+    const q = userSearch.trim().toLowerCase();
+    return users.filter((u) => {
+      if (statusFilter !== 'all' && u.status !== statusFilter) return false;
+      if (!q) return true;
+      return (
+        u.email.toLowerCase().includes(q) ||
+        u.displayName.toLowerCase().includes(q) ||
+        u.uid.toLowerCase().includes(q)
+      );
+    });
+  }, [users, userSearch, statusFilter]);
+
+  const filteredLogs = useMemo(() => {
+    const q = activitySearch.trim().toLowerCase();
+    if (!q) return logs;
+    return logs.filter(
+      (l) =>
+        l.userEmail.toLowerCase().includes(q) ||
+        l.userDisplayName.toLowerCase().includes(q) ||
+        l.action.toLowerCase().includes(q) ||
+        l.details.toLowerCase().includes(q)
+    );
+  }, [logs, activitySearch]);
+
+  const handleSetUserStatus = async (
+    target: FirebaseUserProfile,
+    nextStatus: UserApprovalStatus
   ) => {
     setError(null);
+    setBanner(null);
+    setUpdatingUid(target.uid);
+    const path = `users/${target.uid}`;
     try {
-      const res = await fetch(`/api/admin/requests/${requestId}/decide`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          decision,
-          rejectionReason: reason?.trim() || '',
-        }),
+      await updateDoc(doc(db, 'users', target.uid), {
+        status: nextStatus,
+        updatedAt: serverTimestamp(),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data?.error || `Failed to ${decision} request.`);
-        return;
-      }
-
-      setRequests((prev) =>
-        prev.map((r) => (r.id === requestId ? data.request : r))
+      await logUserAction(
+        currentUser,
+        nextStatus === 'approved' ? 'admin_approve_user' : 'admin_block_user',
+        `${nextStatus === 'approved' ? 'Approved' : 'Blocked'} ${target.email || target.uid}`
       );
-      if (decision === 'accept' && data.customer) {
-        setCustomers((prev) => [data.customer, ...prev]);
-      }
-      setRejectingId(null);
-      setRejectionReason('');
-    } catch {
-      setError(`Network error while processing ${decision}.`);
-    }
-  };
-
-  const handleDeleteRequest = async (requestId: string) => {
-    setError(null);
-    try {
-      const res = await fetch(`/api/admin/requests/${requestId}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` },
-        cache: 'no-store',
-      });
-      if (!res.ok) {
-        const data = await res.json();
-        setError(data?.error || 'Failed to delete request.');
-        return;
-      }
-      setRequests((prev) => prev.filter((r) => r.id !== requestId));
-    } catch {
-      setError('Network error deleting request.');
-    }
-  };
-
-  const handleCreateCustomer = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError(null);
-    setCreatedBanner(null);
-
-    const trimmedEmail = customerEmail.trim().toLowerCase();
-    const trimmedId = customId.trim();
-    if ((!trimmedId && !trimmedEmail) || !password) {
-      setError('Enter an Email ID (or User ID) and Password.');
-      return;
-    }
-
-    setCreating(true);
-    try {
-      const res = await fetch('/api/admin/customers', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          email: trimmedEmail,
-          customId: trimmedId,
-          displayName: displayName.trim() || trimmedId || trimmedEmail.split('@')[0],
-          password,
-          assignedDeviceId,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data?.error || 'Could not create user account.');
-        return;
-      }
-
-      setCustomers((prev) => [data.customer, ...prev]);
-      setCreatedBanner({
-        customId: data.customer?.customId || trimmedId,
-        email: data.customer?.email || (trimmedEmail || undefined),
-        password,
-      });
-      setCustomerEmail('');
-      setCustomId('');
-      setDisplayName('');
-      setPassword('');
-    } catch {
-      setError('Network error while creating account.');
+      setBanner(
+        `${target.email || target.displayName} is now ${nextStatus.toUpperCase()}.`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update user status.');
+      handleFirestoreError(err, OperationType.UPDATE, path);
     } finally {
-      setCreating(false);
+      setUpdatingUid(null);
     }
   };
 
-  const handleToggleActive = async (customer: CustomerAccount) => {
-    setError(null);
-    try {
-      const res = await fetch(`/api/admin/customers/${customer.id}`, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ active: !customer.active }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data?.error || 'Failed to update customer status.');
-        return;
-      }
-      setCustomers((prev) =>
-        prev.map((c) => (c.id === customer.id ? data.customer : c))
-      );
-    } catch {
-      setError('Network error updating customer status.');
-    }
-  };
-
-  const handleSavePasswordReset = async (customerId: string) => {
-    if (resetPasswordVal.length < 4) {
-      setError('New password must be at least 4 characters.');
-      return;
-    }
-    setError(null);
-    try {
-      const res = await fetch(`/api/admin/customers/${customerId}`, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ password: resetPasswordVal }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data?.error || 'Failed to reset password.');
-        return;
-      }
-      setCustomers((prev) =>
-        prev.map((c) => (c.id === customerId ? data.customer : c))
-      );
-      setResetTargetId(null);
-      setResetPasswordVal('');
-    } catch {
-      setError('Network error resetting password.');
-    }
-  };
-
-  const handleDeleteCustomer = async (customerId: string) => {
-    setError(null);
-    try {
-      const res = await fetch(`/api/admin/customers/${customerId}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!res.ok) {
-        const data = await res.json();
-        setError(data?.error || 'Failed to delete customer.');
-        return;
-      }
-      setCustomers((prev) => prev.filter((c) => c.id !== customerId));
-    } catch {
-      setError('Network error deleting customer.');
-    }
-  };
-
-  const handleCopyCredentials = async () => {
-    if (!createdBanner) return;
-    const text = [
-      'FF TUNE User Login',
-      createdBanner.email ? `Email ID: ${createdBanner.email}` : null,
-      `User ID: ${createdBanner.customId}`,
-      `Password: ${createdBanner.password}`,
-    ]
-      .filter(Boolean)
-      .join('\n');
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopiedCreds(true);
-      setTimeout(() => setCopiedCreds(false), 2000);
-    } catch {
-      // Ignore clipboard failures
-    }
-  };
-
-  const handleCreateAdminAccount = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError(null);
-    setAdminCreatedBanner(null);
-
-    const trimmedId = newAdmAccountId.trim();
-    if (!trimmedId || newAdmAccountPass.length < 6) {
-      setError('Admin ID is required and password must be at least 6 characters.');
-      return;
-    }
-
-    setCreatingAdmin(true);
-    try {
-      const res = await fetch('/api/admin/admins', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          customId: trimmedId,
-          displayName: newAdmAccountName.trim() || `Admin (${trimmedId})`,
-          password: newAdmAccountPass,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data?.error || 'Could not create admin account.');
-        return;
-      }
-      setAdmins((prev) => [data.admin, ...prev]);
-      setAdminCreatedBanner(`Full-access Admin ID "${trimmedId}" created.`);
-      setNewAdmAccountId('');
-      setNewAdmAccountName('');
-      setNewAdmAccountPass('');
-    } catch {
-      setError('Network error creating admin account.');
-    } finally {
-      setCreatingAdmin(false);
-    }
-  };
-
-  const handleToggleAdminActive = async (adminAcc: AdminAccount) => {
-    setError(null);
-    try {
-      const res = await fetch(`/api/admin/admins/${adminAcc.id}`, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ active: !adminAcc.active }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data?.error || 'Failed to update admin status.');
-        return;
-      }
-      setAdmins((prev) =>
-        prev.map((a) => (a.id === adminAcc.id ? data.admin : a))
-      );
-    } catch {
-      setError('Network error updating admin status.');
-    }
-  };
-
-  const handleDeleteAdminAccount = async (adminId: string) => {
-    setError(null);
-    try {
-      const res = await fetch(`/api/admin/admins/${adminId}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data?.error || 'Failed to delete admin account.');
-        return;
-      }
-      setAdmins((prev) => prev.filter((a) => a.id !== adminId));
-    } catch {
-      setError('Network error deleting admin account.');
-    }
-  };
-
-  const builtInIds = useMemo(
-    () => new Set(DEVICE_CATALOG.map((d) => d.id)),
-    []
-  );
-  const upsertedIds = useMemo(
+  // Catalog override helpers
+  const overriddenIdSet = useMemo(
     () => new Set(catalogOverrides.upsertedDevices.map((d) => d.id)),
     [catalogOverrides.upsertedDevices]
   );
 
-  const filteredMasterDevices = useMemo(() => {
+  const builtInIdSet = useMemo(() => new Set(DEVICE_CATALOG.map((d) => d.id)), []);
+
+  const filteredMasterCatalog = useMemo(() => {
     const q = catalogSearch.trim().toLowerCase();
     return masterDevices.filter((d) => {
-      if (catalogBrandFilter === 'samsung' && d.brand !== 'Samsung') return false;
-      if (
-        catalogBrandFilter === 'xiaomi' &&
-        d.brand !== 'Xiaomi' &&
-        d.brand !== 'POCO'
-      ) {
-        return false;
-      }
-      if (catalogBrandFilter === 'motorola' && d.brand !== 'Motorola') return false;
-      if (
-        catalogBrandFilter === 'vivo' &&
-        d.brand !== 'Vivo' &&
-        d.brand !== 'iQOO'
-      ) {
-        return false;
-      }
+      const b = d.brand.toLowerCase();
+      if (catalogBrandFilter === 'samsung' && b !== 'samsung') return false;
+      if (catalogBrandFilter === 'xiaomi' && b !== 'xiaomi') return false;
+      if (catalogBrandFilter === 'motorola' && b !== 'motorola') return false;
+      if (catalogBrandFilter === 'vivo' && b !== 'vivo') return false;
       if (
         catalogBrandFilter === 'other' &&
-        ['Samsung', 'Xiaomi', 'POCO', 'Motorola', 'Vivo', 'iQOO'].includes(d.brand)
+        (b === 'samsung' || b === 'xiaomi' || b === 'motorola' || b === 'vivo')
       ) {
         return false;
       }
       if (!q) return true;
-      return `${d.id} ${d.brand} ${d.model} ${d.chipset} ${d.ramGb}gb`
-        .toLowerCase()
-        .includes(q);
+      return `${d.brand} ${d.model} ${d.chipset} ${d.id}`.toLowerCase().includes(q);
     });
   }, [masterDevices, catalogSearch, catalogBrandFilter]);
 
-  const displayedCatalogDevices = useMemo(() => {
-    if (catalogShowAll || catalogSearch.trim().length > 0) {
-      return filteredMasterDevices;
-    }
-    return filteredMasterDevices.slice(0, 20);
-  }, [filteredMasterDevices, catalogShowAll, catalogSearch]);
+  const visibleCatalogRows = useMemo(
+    () =>
+      catalogShowAll || catalogSearch.trim()
+        ? filteredMasterCatalog
+        : filteredMasterCatalog.slice(0, 20),
+    [filteredMasterCatalog, catalogShowAll, catalogSearch]
+  );
 
-  const parsedBulkPreview = useMemo(() => {
-    if (!bulkInput.trim()) return null;
-    return parseBulkDevicesInput(bulkInput);
-  }, [bulkInput]);
-
-  const handleOpenAddDevice = () => {
-    setEditingBuiltInId(null);
-    setDeviceForm(EMPTY_DEVICE_FORM);
-    setDeviceEditorOpen(true);
-    setBulkPanelOpen(false);
-    setError(null);
-  };
-
-  const handleOpenEditDevice = (device: DeviceSpec) => {
-    setEditingBuiltInId(device.id);
-    setDeviceForm(deviceToFormState(device));
-    setDeviceEditorOpen(true);
-    setBulkPanelOpen(false);
-    setError(null);
-  };
-
-  const handleSaveMasterDevice = async (e: React.FormEvent) => {
+  const handleSaveCatalogDevice = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
-    setCatalogBanner(null);
-
+    setBanner(null);
     if (!deviceForm.brand.trim() || !deviceForm.model.trim()) {
-      setError('Brand and model are required.');
+      setError('Brand and Model are required.');
       return;
     }
-
     setCatalogSaving(true);
-    try {
-      const payload: Partial<DeviceSpec> = {
-        ...(deviceForm.id.trim() ? { id: deviceForm.id.trim() } : {}),
-        brand: deviceForm.brand.trim(),
-        model: deviceForm.model.trim(),
+    const id = sanitizeFirestoreDeviceId(
+      editingBuiltInId || deviceForm.id,
+      deviceForm.brand,
+      deviceForm.model
+    );
+    const payload = buildCatalogDocPayload(
+      {
+        id,
+        brand: deviceForm.brand,
+        model: deviceForm.model,
         tier: deviceForm.tier,
         os: deviceForm.os,
-        ramGb: Number(deviceForm.ramGb),
-        refreshHz: Number(deviceForm.refreshHz),
-        touchSamplingHz: Number(deviceForm.touchSamplingHz),
-        ppi: Number(deviceForm.ppi),
-        screenInches: Number(deviceForm.screenInches),
-        chipset: deviceForm.chipset.trim(),
-        defaultDpi: Number(deviceForm.defaultDpi),
-        recommendedDpi: Number(deviceForm.recommendedDpi),
+        ramGb: deviceForm.ramGb,
+        refreshHz: deviceForm.refreshHz,
+        touchSamplingHz: deviceForm.touchSamplingHz,
+        ppi: deviceForm.ppi,
+        screenInches: deviceForm.screenInches,
+        chipset: deviceForm.chipset,
+        defaultDpi: deviceForm.defaultDpi,
+        recommendedDpi: deviceForm.recommendedDpi,
         thermalHeadroom: deviceForm.thermalHeadroom,
         presetSensitivity: {
-          general: Number(deviceForm.general),
-          redDot: Number(deviceForm.redDot),
-          scope2x: Number(deviceForm.scope2x),
-          scope4x: Number(deviceForm.scope4x),
-          sniperScope: Number(deviceForm.sniperScope),
-          freeLook: Number(deviceForm.freeLook),
+          general: deviceForm.general,
+          redDot: deviceForm.redDot,
+          scope2x: deviceForm.scope2x,
+          scope4x: deviceForm.scope4x,
+          sniperScope: deviceForm.sniperScope,
+          freeLook: deviceForm.freeLook,
         },
-        presetFireButton: Number(deviceForm.fireButton),
-      };
-
-      const res = await fetch('/api/admin/catalog/devices', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data?.error || 'Could not save device entry.');
-        return;
-      }
-
-      if (data.overrides) {
-        onCatalogOverridesChange(data.overrides);
-      }
-      setCatalogBanner(
-        `Saved "${data.device.brand} ${data.device.model}" to the live master catalog.`
-      );
+        presetFireButton: deviceForm.fireButton,
+      },
+      currentUser.uid,
+      false
+    );
+    try {
+      await setDoc(doc(db, 'catalogDevices', id), payload);
+      setBanner(`Saved ${deviceForm.brand} ${deviceForm.model} to Firestore catalog.`);
       setDeviceEditorOpen(false);
       setEditingBuiltInId(null);
-    } catch {
-      setError('Network error saving device to master catalog.');
+      setDeviceForm(EMPTY_DEVICE_FORM);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `catalogDevices/${id}`);
     } finally {
       setCatalogSaving(false);
     }
@@ -901,106 +699,159 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
 
   const handleBulkImportDevices = async () => {
     setError(null);
-    setCatalogBanner(null);
+    setBanner(null);
     const parsed = parseBulkDevicesInput(bulkInput);
     if (!parsed.ok) {
       setError(parsed.error);
       return;
     }
-
+    if (parsed.devices.length > 200) {
+      setError('Bulk import supports up to 200 devices per batch.');
+      return;
+    }
     setCatalogSaving(true);
     try {
-      const res = await fetch('/api/admin/catalog/bulk', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ devices: parsed.devices }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data?.error || 'Bulk import failed.');
-        return;
+      const batch = writeBatch(db);
+      for (const item of parsed.devices) {
+        const payload = buildCatalogDocPayload(item, currentUser.uid, false);
+        const id = String(payload.id);
+        batch.set(doc(db, 'catalogDevices', id), payload);
       }
-
-      if (data.overrides) {
-        onCatalogOverridesChange(data.overrides);
-      }
-      setCatalogBanner(
-        `Bulk imported ${data.count} device ${data.count === 1 ? 'entry' : 'entries'} into the master catalog.`
-      );
+      await batch.commit();
+      setBanner(`Imported ${parsed.devices.length} devices into Firestore catalog.`);
       setBulkInput('');
       setBulkPanelOpen(false);
-    } catch {
-      setError('Network error during bulk device import.');
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'catalogDevices');
     } finally {
       setCatalogSaving(false);
     }
   };
 
-  const handleRemoveMasterDevice = async (device: DeviceSpec) => {
+  const handleRemoveCatalogDevice = async (device: DeviceSpec) => {
     setError(null);
-    setCatalogBanner(null);
+    setBanner(null);
+    const docId = sanitizeFirestoreDeviceId(device.id, device.brand, device.model);
     try {
-      const res = await fetch(
-        `/api/admin/catalog/devices/${encodeURIComponent(device.id)}`,
-        {
-          method: 'DELETE',
-          headers: { Authorization: `Bearer ${token}` },
-        }
-      );
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data?.error || 'Could not remove device.');
-        return;
+      if (builtInIdSet.has(device.id)) {
+        await setDoc(
+          doc(db, 'catalogDevices', docId),
+          buildCatalogDocPayload(device, currentUser.uid, true)
+        );
+      } else {
+        await deleteDoc(doc(db, 'catalogDevices', docId));
       }
-      if (data.overrides) {
-        onCatalogOverridesChange(data.overrides);
-      }
-      setCatalogBanner(
-        `Removed "${device.brand} ${device.model}" from the active catalog.`
-      );
-    } catch {
-      setError('Network error removing device.');
+      setBanner(`Removed ${device.brand} ${device.model} from catalog.`);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `catalogDevices/${docId}`);
     }
   };
 
-  const handleRestoreCatalogDefaults = async (mode: 'removed' | 'all') => {
+  const handleRestoreCatalog = async () => {
     setError(null);
-    setCatalogBanner(null);
-    setCatalogSaving(true);
+    setBanner(null);
     try {
-      const res = await fetch('/api/admin/catalog/restore', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ mode }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data?.error || 'Failed to restore catalog defaults.');
-        return;
+      const batch = writeBatch(db);
+      for (const d of catalogOverrides.upsertedDevices) {
+        batch.delete(doc(db, 'catalogDevices', d.id));
       }
-      if (data.overrides) {
-        onCatalogOverridesChange(data.overrides);
+      for (const id of catalogOverrides.removedIds) {
+        batch.delete(doc(db, 'catalogDevices', id));
       }
-      setCatalogBanner(
-        mode === 'removed'
-          ? 'Restored previously removed built-in devices.'
-          : 'Restored master catalog to built-in factory defaults.'
-      );
-    } catch {
-      setError('Network error restoring catalog defaults.');
-    } finally {
-      setCatalogSaving(false);
+      await batch.commit();
+      setBanner('Restored built-in device catalog defaults.');
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, 'catalogDevices');
     }
   };
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between border-b border-slate-800/90 pb-5">
+        <div>
+          <div className="inline-flex items-center gap-2 rounded-md border border-orange-500/30 bg-orange-500/10 px-2.5 py-1 text-[11px] font-semibold text-orange-300">
+            <ShieldCheck className="h-3.5 w-3.5" />
+            /admin · Restricted to {ADMIN_EMAIL}
+          </div>
+          <h1 className="mt-2 font-['Outfit'] text-2xl font-bold tracking-tight text-white">
+            Admin User Approval &amp; Activity Console
+          </h1>
+          <p className="mt-1 text-sm text-slate-400">
+            Review every user&apos;s approval status, last login timestamp, and recorded actions in real time.
+          </p>
+        </div>
+      </div>
+
+      {/* KPI Metrics */}
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+        <div className="rounded-xl border border-slate-800 bg-[#111622] p-4">
+          <p className="text-[11px] font-medium text-slate-400">Total Users</p>
+          <p className="mt-1 font-mono text-2xl font-bold text-white">{counts.total}</p>
+        </div>
+        <div className="rounded-xl border border-amber-500/30 bg-amber-950/15 p-4">
+          <p className="text-[11px] font-medium text-amber-300">Pending Approval</p>
+          <p className="mt-1 font-mono text-2xl font-bold text-amber-400">{counts.pending}</p>
+        </div>
+        <div className="rounded-xl border border-emerald-500/30 bg-emerald-950/15 p-4">
+          <p className="text-[11px] font-medium text-emerald-300">Approved</p>
+          <p className="mt-1 font-mono text-2xl font-bold text-emerald-400">{counts.approved}</p>
+        </div>
+        <div className="rounded-xl border border-rose-500/30 bg-rose-950/15 p-4">
+          <p className="text-[11px] font-medium text-rose-300">Blocked</p>
+          <p className="mt-1 font-mono text-2xl font-bold text-rose-400">{counts.blocked}</p>
+        </div>
+        <div className="col-span-2 sm:col-span-1 rounded-xl border border-slate-800 bg-[#111622] p-4">
+          <p className="text-[11px] font-medium text-slate-400">Logged Actions</p>
+          <p className="mt-1 font-mono text-2xl font-bold text-orange-400">{counts.logs}</p>
+        </div>
+      </div>
+
+      {/* Section Switcher */}
+      <div className="flex flex-wrap items-center gap-2 border-b border-slate-800 pb-3">
+        <button
+          type="button"
+          onClick={() => setSectionTab('users')}
+          className={`inline-flex items-center gap-2 rounded-lg px-3.5 py-2 text-xs font-semibold transition-colors ${
+            sectionTab === 'users'
+              ? 'bg-orange-500 text-slate-950'
+              : 'border border-slate-800 bg-[#111622] text-slate-300 hover:text-white'
+          }`}
+        >
+          <Users className="h-3.5 w-3.5" />
+          All Users ({counts.total})
+          {counts.pending > 0 && (
+            <span className="rounded bg-slate-950/20 px-1.5 py-0.5 font-mono text-[10px] font-bold">
+              {counts.pending} pending
+            </span>
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={() => setSectionTab('activity')}
+          className={`inline-flex items-center gap-2 rounded-lg px-3.5 py-2 text-xs font-semibold transition-colors ${
+            sectionTab === 'activity'
+              ? 'bg-orange-500 text-slate-950'
+              : 'border border-slate-800 bg-[#111622] text-slate-300 hover:text-white'
+          }`}
+        >
+          <Activity className="h-3.5 w-3.5" />
+          All Activity Feed ({counts.logs})
+        </button>
+        <button
+          type="button"
+          onClick={() => setSectionTab('catalog')}
+          className={`inline-flex items-center gap-2 rounded-lg px-3.5 py-2 text-xs font-semibold transition-colors ${
+            sectionTab === 'catalog'
+              ? 'bg-orange-500 text-slate-950'
+              : 'border border-slate-800 bg-[#111622] text-slate-300 hover:text-white'
+          }`}
+        >
+          <SlidersHorizontal className="h-3.5 w-3.5" />
+          Device Catalog ({masterDevices.length})
+        </button>
+      </div>
+
       {error && (
         <div
           role="alert"
@@ -1010,1338 +861,555 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         </div>
       )}
 
-      {/* Customer Access Requests Queue (Accept / Reject) */}
-      <section className="rounded-xl border border-slate-800/90 bg-[#111622] overflow-hidden">
-        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800/80 px-6 py-4">
-          <div>
-            <div className="flex items-center gap-2">
-              <Inbox className="h-4 w-4 text-orange-400" />
-              <h2 className="text-lg font-semibold text-white">
-                Customer Requests
-              </h2>
-            </div>
-            <p className="mt-0.5 text-xs text-slate-400">
-              {pendingCount} pending {pendingCount === 1 ? 'request' : 'requests'} awaiting Accept or Reject review
-              {lastSyncedAt ? ` · Live synced ${lastSyncedAt}` : ''}
-            </p>
-          </div>
+      {banner && (
+        <div
+          role="status"
+          className="rounded-lg border border-emerald-500/40 bg-emerald-950/25 px-4 py-3 text-xs text-emerald-300"
+        >
+          {banner}
+        </div>
+      )}
 
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="flex items-center gap-1 rounded-lg bg-[#0B0E14] p-1 border border-slate-800">
-              {(
-                [
-                  { id: 'pending', label: `Pending (${pendingCount})` },
-                  { id: 'accepted', label: 'Accepted' },
-                  { id: 'rejected', label: 'Rejected' },
-                  { id: 'all', label: 'All' },
-                ] as const
-              ).map((tab) => (
+      {/* TAB 1: USERS LIST */}
+      {sectionTab === 'users' && (
+        <div className="space-y-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="relative flex-1 max-w-md">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+              <input
+                type="text"
+                value={userSearch}
+                onChange={(e) => setUserSearch(e.target.value)}
+                placeholder="Search by email, name, or UID..."
+                className="w-full rounded-lg border border-slate-700 bg-[#111622] py-2 pl-9 pr-3.5 text-sm text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
+              />
+            </div>
+
+            <div className="flex flex-wrap gap-1.5">
+              {(['all', 'pending', 'approved', 'blocked'] as UserStatusFilter[]).map((f) => (
                 <button
-                  key={tab.id}
+                  key={f}
                   type="button"
-                  onClick={() => setRequestFilter(tab.id)}
-                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
-                    requestFilter === tab.id
-                      ? 'bg-orange-500 text-slate-950 font-semibold'
-                      : 'text-slate-400 hover:text-white'
+                  onClick={() => setStatusFilter(f)}
+                  className={`rounded-md px-3 py-1.5 text-xs font-semibold capitalize transition-colors ${
+                    statusFilter === f
+                      ? 'bg-orange-500 text-slate-950'
+                      : 'border border-slate-800 bg-[#111622] text-slate-400 hover:text-white'
                   }`}
                 >
-                  {tab.label}
+                  {f}
                 </button>
               ))}
             </div>
-
-            <button
-              type="button"
-              onClick={() => fetchAdminData(false)}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white transition-colors"
-            >
-              <RefreshCw className={`h-3.5 w-3.5 ${syncing ? 'animate-spin text-orange-400' : ''}`} />
-              Refresh
-            </button>
           </div>
-        </div>
 
-        {loading ? (
-          <div className="px-6 py-12 text-center text-xs text-slate-400">
-            Loading customer requests...
-          </div>
-        ) : filteredRequests.length === 0 ? (
-          <div className="px-6 py-12 text-center">
-            <p className="text-sm font-medium text-white">
-              No {requestFilter === 'all' ? '' : requestFilter} requests
-            </p>
-            <p className="mt-1 text-xs text-slate-400">
-              New requests submitted from the Customer Login page appear here for approval.
-            </p>
-          </div>
-        ) : (
-          <div className="divide-y divide-slate-800/70">
-            {filteredRequests.map((reqItem) => {
-              const dev = devices.find((d) => d.id === reqItem.requestedDeviceId);
-              return (
-                <div
-                  key={reqItem.id}
-                  className="px-6 py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
-                >
-                  <div className="min-w-0 space-y-1">
-                    <div className="flex flex-wrap items-center gap-2 text-xs">
-                      <span className="font-mono text-sm font-semibold text-white">
-                        {reqItem.email || reqItem.customId}
-                      </span>
-                      {reqItem.email && (
-                        <>
-                          <span className="text-slate-500">·</span>
-                          <span className="font-mono text-slate-400">@{reqItem.customId}</span>
-                        </>
-                      )}
-                      <span className="text-slate-500">·</span>
-                      <span className="text-slate-300">{reqItem.displayName}</span>
-                      <span className="text-slate-500">·</span>
-                      <span
-                        className={`font-medium ${
-                          reqItem.status === 'accepted'
-                            ? 'text-emerald-400'
-                            : reqItem.status === 'rejected'
-                              ? 'text-rose-400'
-                              : 'text-amber-400'
-                        }`}
-                      >
-                        {reqItem.status === 'accepted'
-                          ? 'Access Granted'
-                          : reqItem.status === 'rejected'
-                            ? 'Rejected'
-                            : 'Pending'}
-                      </span>
-                    </div>
+          {loading ? (
+            <div className="rounded-xl border border-slate-800 bg-[#111622] p-8 text-center text-sm text-slate-400">
+              Loading users from Firestore...
+            </div>
+          ) : filteredUsers.length === 0 ? (
+            <div className="rounded-xl border border-slate-800 bg-[#111622] p-8 text-center text-sm text-slate-400">
+              No users match the selected filter.
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {filteredUsers.map((u) => {
+                const userActions = logsByUserId[u.uid] || [];
+                const isExpanded = Boolean(expandedUserIds[u.uid]);
+                const isSelfAdmin = u.email.toLowerCase() === ADMIN_EMAIL;
+                const deviceObj = devices.find((d) => d.id === u.requestedDeviceId);
 
-                    <p className="text-xs text-slate-400">
-                      Device: {dev ? `${dev.brand} ${dev.model}` : reqItem.requestedDeviceId}
-                      {' · '}
-                      Submitted {new Date(reqItem.createdAt).toLocaleString()}
-                    </p>
+                return (
+                  <div
+                    key={u.uid}
+                    className="rounded-xl border border-slate-800/90 bg-[#111622] p-4 sm:p-5 space-y-4"
+                  >
+                    <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                      {/* Identity & Timestamps */}
+                      <div className="flex items-start gap-3.5 min-w-0">
+                        {u.photoURL ? (
+                          <img
+                            src={u.photoURL}
+                            alt={u.displayName}
+                            referrerPolicy="no-referrer"
+                            className="h-11 w-11 rounded-full border border-slate-700 object-cover shrink-0"
+                          />
+                        ) : (
+                          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-slate-700 bg-[#0B0E14] font-semibold text-sm text-orange-400">
+                            {(u.displayName || u.email || 'U').charAt(0).toUpperCase()}
+                          </div>
+                        )}
 
-                    {reqItem.note && (
-                      <p className="text-xs text-slate-300">
-                        Note: {reqItem.note}
-                      </p>
-                    )}
+                        <div className="min-w-0 space-y-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="text-sm font-semibold text-white truncate">
+                              {u.displayName}
+                            </p>
+                            <span
+                              className={`rounded px-2 py-0.5 font-mono text-[10px] font-bold uppercase ${
+                                u.status === 'approved'
+                                  ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                                  : u.status === 'blocked'
+                                    ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
+                                    : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                              }`}
+                            >
+                              {u.status}
+                            </span>
+                            {u.role === 'admin' && (
+                              <span className="rounded bg-orange-500/15 border border-orange-500/30 px-2 py-0.5 font-mono text-[10px] font-bold uppercase text-orange-300">
+                                ADMIN
+                              </span>
+                            )}
+                          </div>
 
-                    {reqItem.status === 'rejected' && reqItem.rejectionReason && (
-                      <p className="text-xs text-rose-300">
-                        Reason: {reqItem.rejectionReason}
-                      </p>
-                    )}
-                  </div>
+                          <p className="font-mono text-xs text-slate-300 break-all">
+                            {u.email}
+                          </p>
 
-                  {reqItem.status === 'pending' ? (
-                    <div className="flex flex-col items-end gap-2 shrink-0">
-                      <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => handleDecision(reqItem.id, 'accept')}
-                          className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3.5 py-2 text-xs font-semibold text-slate-950 hover:bg-emerald-400 transition-colors whitespace-nowrap"
-                        >
-                          <Check className="h-3.5 w-3.5" />
-                          Grant Access
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setRejectingId(rejectingId === reqItem.id ? null : reqItem.id);
-                            setRejectionReason('');
-                          }}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/40 bg-rose-950/30 px-3.5 py-2 text-xs font-semibold text-rose-300 hover:bg-rose-950/60 transition-colors whitespace-nowrap"
-                        >
-                          <X className="h-3.5 w-3.5" />
-                          Reject
-                        </button>
+                          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-400">
+                            <span className="inline-flex items-center gap-1">
+                              <Clock className="h-3 w-3 text-orange-400" />
+                              Last login:{' '}
+                              <span className="text-slate-200 font-medium">
+                                {u.lastLoginAt
+                                  ? `${formatRelativeTime(u.lastLoginAt)} (${new Date(u.lastLoginAt).toLocaleString()})`
+                                  : 'Never'}
+                              </span>
+                            </span>
+                            <span>
+                              Joined:{' '}
+                              <span className="text-slate-300">
+                                {u.createdAt ? new Date(u.createdAt).toLocaleDateString() : '—'}
+                              </span>
+                            </span>
+                            <span>
+                              Device:{' '}
+                              <span className="text-slate-300">
+                                {deviceObj
+                                  ? `${deviceObj.brand} ${deviceObj.model}`
+                                  : u.requestedDeviceId}
+                              </span>
+                            </span>
+                          </div>
+                        </div>
                       </div>
 
-                      {rejectingId === reqItem.id && (
-                        <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
-                          <input
-                            type="text"
-                            value={rejectionReason}
-                            onChange={(e) => setRejectionReason(e.target.value)}
-                            placeholder="Optional rejection reason"
-                            className="rounded-md border border-slate-700 bg-[#0B0E14] px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:border-rose-500 focus:outline-none"
-                          />
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleDecision(reqItem.id, 'reject', rejectionReason)
-                            }
-                            className="rounded-md bg-rose-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-rose-400 transition-colors"
-                          >
-                            Confirm Reject
-                          </button>
+                      {/* Approve / Block Buttons */}
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setExpandedUserIds((prev) => ({
+                              ...prev,
+                              [u.uid]: !prev[u.uid],
+                            }))
+                          }
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white transition-colors"
+                        >
+                          <Activity className="h-3.5 w-3.5 text-orange-400" />
+                          Actions ({userActions.length})
+                          {isExpanded ? (
+                            <ChevronUp className="h-3.5 w-3.5" />
+                          ) : (
+                            <ChevronDown className="h-3.5 w-3.5" />
+                          )}
+                        </button>
+
+                        {!isSelfAdmin && (
+                          <>
+                            <button
+                              type="button"
+                              disabled={updatingUid === u.uid || u.status === 'approved'}
+                              onClick={() => handleSetUserStatus(u, 'approved')}
+                              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3.5 py-2 text-xs font-semibold text-slate-950 hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                            >
+                              <Check className="h-3.5 w-3.5" />
+                              {u.status === 'approved' ? 'Approved' : 'Approve'}
+                            </button>
+
+                            <button
+                              type="button"
+                              disabled={updatingUid === u.uid || u.status === 'blocked'}
+                              onClick={() => handleSetUserStatus(u, 'blocked')}
+                              className="inline-flex items-center gap-1.5 rounded-lg bg-rose-500/90 px-3.5 py-2 text-xs font-semibold text-white hover:bg-rose-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                            >
+                              <ShieldOff className="h-3.5 w-3.5" />
+                              {u.status === 'blocked' ? 'Blocked' : 'Block'}
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Recent Actions Preview (always visible) */}
+                    <div className="rounded-lg border border-slate-800/80 bg-[#0B0E14] px-3.5 py-2.5">
+                      <div className="flex items-center justify-between text-[11px] text-slate-400 mb-1.5">
+                        <span className="font-semibold text-slate-300">
+                          Recent Actions Taken
+                        </span>
+                        <span className="font-mono text-slate-500">UID: {u.uid}</span>
+                      </div>
+                      {userActions.length === 0 ? (
+                        <p className="text-xs text-slate-500">No actions recorded yet.</p>
+                      ) : (
+                        <div className="space-y-1.5">
+                          {(isExpanded ? userActions : userActions.slice(0, 3)).map((act) => (
+                            <div
+                              key={act.id}
+                              className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1 text-xs border-b border-slate-800/50 last:border-b-0 pb-1.5 last:pb-0"
+                            >
+                              <div className="flex items-center gap-2 min-w-0">
+                                <span className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-orange-300 shrink-0">
+                                  {formatActionLabel(act.action)}
+                                </span>
+                                <span className="text-slate-200 truncate">{act.details}</span>
+                              </div>
+                              <span className="font-mono text-[11px] text-slate-500 shrink-0">
+                                {act.createdAt
+                                  ? `${formatRelativeTime(act.createdAt)} · ${new Date(act.createdAt).toLocaleTimeString()}`
+                                  : '—'}
+                              </span>
+                            </div>
+                          ))}
                         </div>
                       )}
                     </div>
-                  ) : (
-                    <div className="flex items-center gap-3 text-right text-xs text-slate-400 shrink-0">
-                      {reqItem.reviewedAt && (
-                        <span>
-                          Reviewed {new Date(reqItem.reviewedAt).toLocaleDateString()}
-                        </span>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => handleDeleteRequest(reqItem.id)}
-                        className="inline-flex items-center gap-1 rounded-md border border-slate-700 px-2.5 py-1.5 text-[11px] text-slate-300 hover:border-rose-500/50 hover:text-rose-300 transition-colors"
-                        title="Remove request record"
-                      >
-                        <Trash2 className="h-3 w-3" />
-                        Remove
-                      </button>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </section>
-
-      {/* Master Device Sensitivity Catalog Manager */}
-      <section className="rounded-xl border border-slate-800/90 bg-[#111622] overflow-hidden">
-        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800/80 px-6 py-4">
-          <div>
-            <div className="flex items-center gap-2">
-              <SlidersHorizontal className="h-4 w-4 text-orange-400" />
-              <h2 className="text-lg font-semibold text-white">
-                Master Device Sensitivity Catalog
-              </h2>
+                  </div>
+                );
+              })}
             </div>
-            <p className="mt-0.5 text-xs text-slate-400">
-              {masterDevices.length} active models ·{' '}
-              {catalogOverrides.upsertedDevices.length} customized/added ·{' '}
-              {catalogOverrides.removedIds.length} removed (persists live without editing code)
-            </p>
+          )}
+        </div>
+      )}
+
+      {/* TAB 2: GLOBAL ACTIVITY FEED */}
+      {sectionTab === 'activity' && (
+        <div className="space-y-4">
+          <div className="relative max-w-md">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+            <input
+              type="text"
+              value={activitySearch}
+              onChange={(e) => setActivitySearch(e.target.value)}
+              placeholder="Filter logs by email, action, or details..."
+              className="w-full rounded-lg border border-slate-700 bg-[#111622] py-2 pl-9 pr-3.5 text-sm text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
+            />
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            {(catalogOverrides.upsertedDevices.length > 0 ||
-              catalogOverrides.removedIds.length > 0) && (
-              <button
-                type="button"
-                disabled={catalogSaving}
-                onClick={() => handleRestoreCatalogDefaults('all')}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white disabled:opacity-50 transition-colors"
-              >
-                <RotateCcw className="h-3.5 w-3.5" />
-                Restore Defaults
-              </button>
+          <div className="rounded-xl border border-slate-800 bg-[#111622] divide-y divide-slate-800/80">
+            {filteredLogs.length === 0 ? (
+              <div className="p-8 text-center text-sm text-slate-400">
+                No activity logs recorded yet.
+              </div>
+            ) : (
+              filteredLogs.map((log) => (
+                <div
+                  key={log.id}
+                  className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 py-3 text-xs"
+                >
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded bg-orange-500/15 border border-orange-500/30 px-2 py-0.5 font-mono text-[10px] font-semibold text-orange-300">
+                        {formatActionLabel(log.action)}
+                      </span>
+                      <span className="font-semibold text-white">{log.userDisplayName}</span>
+                      <span className="font-mono text-slate-400">{log.userEmail}</span>
+                    </div>
+                    <p className="text-slate-300">{log.details}</p>
+                  </div>
+                  <span className="font-mono text-[11px] text-slate-500 shrink-0">
+                    {log.createdAt ? new Date(log.createdAt).toLocaleString() : '—'}
+                  </span>
+                </div>
+              ))
             )}
-            <button
-              type="button"
-              onClick={() => {
-                setBulkPanelOpen((prev) => !prev);
-                setDeviceEditorOpen(false);
-              }}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-[#161C2B] px-3 py-2 text-xs font-medium text-slate-200 hover:border-orange-500/60 hover:text-white transition-colors"
-            >
-              <Upload className="h-3.5 w-3.5 text-orange-400" />
-              Bulk Add (CSV / JSON)
-            </button>
-            <button
-              type="button"
-              onClick={handleOpenAddDevice}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-orange-500 px-3.5 py-2 text-xs font-semibold text-slate-950 hover:bg-orange-400 transition-colors"
-            >
-              <Plus className="h-3.5 w-3.5" />
-              Add Device
-            </button>
           </div>
         </div>
+      )}
 
-        {catalogBanner && (
-          <div className="mx-6 mt-4 rounded-lg border border-emerald-500/40 bg-emerald-950/25 px-4 py-2.5 text-xs text-emerald-300">
-            {catalogBanner}
-          </div>
-        )}
-
-        {/* Single Device Add / Edit Sensitivity Drawer */}
-        {deviceEditorOpen && (
-          <form
-            onSubmit={handleSaveMasterDevice}
-            className="mx-6 mt-5 rounded-xl border border-slate-800 bg-[#0B0E14] p-5 space-y-5"
-          >
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-              <div>
-                <h3 className="text-sm font-semibold text-white">
-                  {editingBuiltInId
-                    ? `Edit Device Sensitivity (${deviceForm.brand} ${deviceForm.model})`
-                    : 'Add New Device to Master Catalog'}
-                </h3>
-                <p className="mt-0.5 text-[11px] text-slate-400">
-                  Set hardware profile and calibrated OB44+ 0–200 sensitivity baselines.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setDeviceEditorOpen(false)}
-                className="flex h-8 w-8 items-center justify-center rounded-md text-slate-400 hover:bg-slate-800 hover:text-white"
-                aria-label="Close device editor"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-              <div>
-                <label htmlFor="cat-brand" className="block text-xs font-medium text-slate-300">
-                  Brand
-                </label>
-                <input
-                  id="cat-brand"
-                  type="text"
-                  required
-                  value={deviceForm.brand}
-                  onChange={(e) => setDeviceForm((f) => ({ ...f, brand: e.target.value }))}
-                  placeholder="Xiaomi / Motorola / Vivo"
-                  className="mt-1 w-full rounded-lg border border-slate-700 bg-[#111622] px-3 py-2 text-xs text-white focus:border-orange-500 focus:outline-none"
-                />
-              </div>
-
-              <div>
-                <label htmlFor="cat-model" className="block text-xs font-medium text-slate-300">
-                  Model Name
-                </label>
-                <input
-                  id="cat-model"
-                  type="text"
-                  required
-                  value={deviceForm.model}
-                  onChange={(e) => setDeviceForm((f) => ({ ...f, model: e.target.value }))}
-                  placeholder="e.g. Redmi Note 14 Pro"
-                  className="mt-1 w-full rounded-lg border border-slate-700 bg-[#111622] px-3 py-2 text-xs text-white focus:border-orange-500 focus:outline-none"
-                />
-              </div>
-
-              <div>
-                <label htmlFor="cat-chipset" className="block text-xs font-medium text-slate-300">
-                  Chipset
-                </label>
-                <input
-                  id="cat-chipset"
-                  type="text"
-                  value={deviceForm.chipset}
-                  onChange={(e) => setDeviceForm((f) => ({ ...f, chipset: e.target.value }))}
-                  placeholder="Snapdragon / Dimensity"
-                  className="mt-1 w-full rounded-lg border border-slate-700 bg-[#111622] px-3 py-2 text-xs text-white focus:border-orange-500 focus:outline-none"
-                />
-              </div>
-
-              <div>
-                <label htmlFor="cat-id" className="block text-xs font-medium text-slate-300">
-                  Device ID (Auto if blank)
-                </label>
-                <input
-                  id="cat-id"
-                  type="text"
-                  disabled={Boolean(editingBuiltInId)}
-                  value={deviceForm.id}
-                  onChange={(e) => setDeviceForm((f) => ({ ...f, id: e.target.value }))}
-                  placeholder="auto-slug"
-                  className="mt-1 w-full rounded-lg border border-slate-700 bg-[#111622] px-3 py-2 text-xs font-mono text-white disabled:opacity-60 focus:border-orange-500 focus:outline-none"
-                />
-              </div>
-
-              <div>
-                <label htmlFor="cat-ram" className="block text-xs font-medium text-slate-300">
-                  RAM (GB)
-                </label>
-                <input
-                  id="cat-ram"
-                  type="number"
-                  min={1}
-                  max={32}
-                  value={deviceForm.ramGb}
-                  onChange={(e) => setDeviceForm((f) => ({ ...f, ramGb: Number(e.target.value) }))}
-                  className="mt-1 w-full rounded-lg border border-slate-700 bg-[#111622] px-3 py-2 text-xs font-mono text-white focus:border-orange-500 focus:outline-none"
-                />
-              </div>
-
-              <div>
-                <label htmlFor="cat-hz" className="block text-xs font-medium text-slate-300">
-                  Refresh Rate (Hz)
-                </label>
-                <input
-                  id="cat-hz"
-                  type="number"
-                  min={30}
-                  max={240}
-                  value={deviceForm.refreshHz}
-                  onChange={(e) => setDeviceForm((f) => ({ ...f, refreshHz: Number(e.target.value) }))}
-                  className="mt-1 w-full rounded-lg border border-slate-700 bg-[#111622] px-3 py-2 text-xs font-mono text-white focus:border-orange-500 focus:outline-none"
-                />
-              </div>
-
-              <div>
-                <label htmlFor="cat-dpi" className="block text-xs font-medium text-slate-300">
-                  Recommended DPI
-                </label>
-                <input
-                  id="cat-dpi"
-                  type="number"
-                  min={100}
-                  max={650}
-                  value={deviceForm.recommendedDpi}
-                  onChange={(e) =>
-                    setDeviceForm((f) => ({ ...f, recommendedDpi: Number(e.target.value) }))
-                  }
-                  className="mt-1 w-full rounded-lg border border-slate-700 bg-[#111622] px-3 py-2 text-xs font-mono text-white focus:border-orange-500 focus:outline-none"
-                />
-              </div>
-
-              <div>
-                <label htmlFor="cat-tier" className="block text-xs font-medium text-slate-300">
-                  Hardware Tier / Thermal
-                </label>
-                <div className="mt-1 grid grid-cols-2 gap-2">
-                  <select
-                    id="cat-tier"
-                    value={deviceForm.tier}
-                    onChange={(e) =>
-                      setDeviceForm((f) => ({ ...f, tier: e.target.value as DeviceTier }))
-                    }
-                    className="rounded-lg border border-slate-700 bg-[#111622] px-2 py-2 text-xs text-white focus:border-orange-500 focus:outline-none"
-                  >
-                    <option value="low">Low (2-3GB)</option>
-                    <option value="mid">Mid (4-6GB)</option>
-                    <option value="high">Flagship</option>
-                    <option value="gaming">Gaming</option>
-                    <option value="ios">iOS</option>
-                  </select>
-                  <select
-                    aria-label="Thermal headroom"
-                    value={deviceForm.thermalHeadroom}
-                    onChange={(e) =>
-                      setDeviceForm((f) => ({
-                        ...f,
-                        thermalHeadroom: e.target.value as 'Tight' | 'Moderate' | 'High',
-                      }))
-                    }
-                    className="rounded-lg border border-slate-700 bg-[#111622] px-2 py-2 text-xs text-white focus:border-orange-500 focus:outline-none"
-                  >
-                    <option value="Tight">Tight</option>
-                    <option value="Moderate">Moderate</option>
-                    <option value="High">High</option>
-                  </select>
-                </div>
-              </div>
-            </div>
-
-            {/* 0-200 Sensitivity Inputs */}
-            <div className="border-t border-slate-800 pt-4">
-              <p className="text-xs font-semibold text-orange-400">
-                Calibrated Sensitivity Baseline (0–200 Scale) &amp; Fire Button Size
+      {/* TAB 3: FIRESTORE DEVICE CATALOG MANAGEMENT */}
+      {sectionTab === 'catalog' && (
+        <div className="space-y-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-base font-semibold text-white">
+                Master Device Sensitivity Catalog
+              </h2>
+              <p className="text-xs text-slate-400">
+                Add, bulk-import, edit, or remove device sensitivity presets stored in Firestore.
               </p>
-              <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-7">
-                {(
-                  [
-                    { key: 'general', label: 'General', min: 0, max: 200 },
-                    { key: 'redDot', label: 'Red Dot', min: 0, max: 200 },
-                    { key: 'scope2x', label: '2x Scope', min: 0, max: 200 },
-                    { key: 'scope4x', label: '4x Scope', min: 0, max: 200 },
-                    { key: 'sniperScope', label: 'Sniper', min: 0, max: 200 },
-                    { key: 'freeLook', label: 'Free Look', min: 0, max: 200 },
-                    { key: 'fireButton', label: 'Fire Btn %', min: 32, max: 70 },
-                  ] as const
-                ).map((field) => (
-                  <div key={field.key}>
-                    <label
-                      htmlFor={`cat-sens-${field.key}`}
-                      className="block text-[11px] font-medium text-slate-300"
-                    >
-                      {field.label}
-                    </label>
-                    <input
-                      id={`cat-sens-${field.key}`}
-                      type="number"
-                      min={field.min}
-                      max={field.max}
-                      value={deviceForm[field.key]}
-                      onChange={(e) =>
-                        setDeviceForm((f) => ({
-                          ...f,
-                          [field.key]: Number(e.target.value),
-                        }))
-                      }
-                      className="mt-1 w-full rounded-lg border border-slate-700 bg-[#111622] px-2.5 py-2 text-xs font-mono font-bold text-orange-400 focus:border-orange-500 focus:outline-none"
-                    />
-                  </div>
-                ))}
-              </div>
             </div>
-
-            <div className="flex justify-end gap-2 border-t border-slate-800 pt-3">
+            <div className="flex flex-wrap gap-2">
               <button
                 type="button"
-                onClick={() => setDeviceEditorOpen(false)}
-                className="rounded-lg border border-slate-700 px-3.5 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800"
+                onClick={() => {
+                  setEditingBuiltInId(null);
+                  setDeviceForm(EMPTY_DEVICE_FORM);
+                  setDeviceEditorOpen((v) => !v);
+                  setBulkPanelOpen(false);
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-orange-500 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-orange-400 transition-colors"
               >
-                Cancel
+                <Plus className="h-3.5 w-3.5" />
+                Add Device
               </button>
               <button
-                type="submit"
-                disabled={catalogSaving}
-                className="rounded-lg bg-orange-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-orange-400 disabled:opacity-60"
+                type="button"
+                onClick={() => {
+                  setBulkPanelOpen((v) => !v);
+                  setDeviceEditorOpen(false);
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-[#111622] px-3 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-800 transition-colors"
               >
-                {catalogSaving ? 'Saving...' : 'Save to Master Catalog'}
+                <Upload className="h-3.5 w-3.5" />
+                Bulk Import
               </button>
+              {(catalogOverrides.upsertedDevices.length > 0 ||
+                catalogOverrides.removedIds.length > 0) && (
+                <button
+                  type="button"
+                  onClick={handleRestoreCatalog}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 transition-colors"
+                >
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  Restore Defaults
+                </button>
+              )}
             </div>
-          </form>
-        )}
+          </div>
 
-        {/* Bulk Add / Update Panel (CSV / JSON) */}
-        {bulkPanelOpen && (
-          <div className="mx-6 mt-5 rounded-xl border border-slate-800 bg-[#0B0E14] p-5 space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
-              <div>
+          {deviceEditorOpen && (
+            <form
+              onSubmit={handleSaveCatalogDevice}
+              className="rounded-xl border border-slate-800 bg-[#111622] p-5 space-y-4"
+            >
+              <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-white">
-                  Bulk Add or Update Devices (JSON or CSV)
+                  {editingBuiltInId ? `Edit ${deviceForm.brand} ${deviceForm.model}` : 'New Device Entry'}
                 </h3>
-                <p className="mt-0.5 text-[11px] text-slate-400">
-                  CSV columns: brand, model, ramGb, refreshHz, chipset, general, redDot, scope2x, scope4x, sniperScope, freeLook, fireButton, recommendedDpi
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => setBulkInput(SAMPLE_CSV_BULK)}
-                  className="rounded-md border border-slate-700 bg-[#111622] px-2.5 py-1.5 text-[11px] font-medium text-slate-200 hover:border-orange-500/60"
-                >
-                  Insert Sample CSV
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setBulkInput(SAMPLE_JSON_BULK)}
-                  className="rounded-md border border-slate-700 bg-[#111622] px-2.5 py-1.5 text-[11px] font-medium text-slate-200 hover:border-orange-500/60"
-                >
-                  Insert Sample JSON
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setBulkPanelOpen(false)}
-                  className="flex h-7 w-7 items-center justify-center rounded-md text-slate-400 hover:bg-slate-800 hover:text-white"
-                  aria-label="Close bulk import"
+                  onClick={() => setDeviceEditorOpen(false)}
+                  className="text-slate-400 hover:text-white"
                 >
                   <X className="h-4 w-4" />
                 </button>
               </div>
-            </div>
-
-            <textarea
-              rows={7}
-              value={bulkInput}
-              onChange={(e) => setBulkInput(e.target.value)}
-              placeholder="Paste CSV rows or a JSON array of device sensitivity objects..."
-              className="w-full rounded-lg border border-slate-700 bg-[#111622] p-3 font-mono text-xs text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
-            />
-
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="text-xs">
-                {parsedBulkPreview === null ? (
-                  <span className="text-slate-400">
-                    Supports up to 200 devices per bulk import.
-                  </span>
-                ) : parsedBulkPreview.ok ? (
-                  <span className="text-emerald-400 font-medium">
-                    Ready to import {parsedBulkPreview.devices.length}{' '}
-                    {parsedBulkPreview.devices.length === 1 ? 'device' : 'devices'}.
-                  </span>
-                ) : (
-                  <span className="text-rose-400">{parsedBulkPreview.error}</span>
-                )}
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <input
+                  type="text"
+                  placeholder="Brand (e.g. Samsung)"
+                  value={deviceForm.brand}
+                  onChange={(e) => setDeviceForm({ ...deviceForm, brand: e.target.value })}
+                  className="rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2 text-xs text-white"
+                />
+                <input
+                  type="text"
+                  placeholder="Model (e.g. Galaxy A55)"
+                  value={deviceForm.model}
+                  onChange={(e) => setDeviceForm({ ...deviceForm, model: e.target.value })}
+                  className="rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2 text-xs text-white"
+                />
+                <input
+                  type="text"
+                  placeholder="Chipset"
+                  value={deviceForm.chipset}
+                  onChange={(e) => setDeviceForm({ ...deviceForm, chipset: e.target.value })}
+                  className="rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2 text-xs text-white"
+                />
+                <input
+                  type="number"
+                  placeholder="RAM GB"
+                  value={deviceForm.ramGb}
+                  onChange={(e) =>
+                    setDeviceForm({ ...deviceForm, ramGb: Number(e.target.value) })
+                  }
+                  className="rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2 text-xs text-white"
+                />
+                <input
+                  type="number"
+                  placeholder="Refresh Hz"
+                  value={deviceForm.refreshHz}
+                  onChange={(e) =>
+                    setDeviceForm({ ...deviceForm, refreshHz: Number(e.target.value) })
+                  }
+                  className="rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2 text-xs text-white"
+                />
+                <input
+                  type="number"
+                  placeholder="Recommended DPI"
+                  value={deviceForm.recommendedDpi}
+                  onChange={(e) =>
+                    setDeviceForm({ ...deviceForm, recommendedDpi: Number(e.target.value) })
+                  }
+                  className="rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2 text-xs text-white"
+                />
               </div>
-
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-7">
+                {(
+                  [
+                    ['general', 'General'],
+                    ['redDot', 'Red Dot'],
+                    ['scope2x', '2x Scope'],
+                    ['scope4x', '4x Scope'],
+                    ['sniperScope', 'Sniper'],
+                    ['freeLook', 'Free Look'],
+                    ['fireButton', 'Fire Btn'],
+                  ] as const
+                ).map(([key, label]) => (
+                  <label key={key} className="block text-[11px] text-slate-400">
+                    {label}
+                    <input
+                      type="number"
+                      value={deviceForm[key]}
+                      onChange={(e) =>
+                        setDeviceForm({ ...deviceForm, [key]: Number(e.target.value) })
+                      }
+                      className="mt-1 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-2.5 py-1.5 text-xs text-white"
+                    />
+                  </label>
+                ))}
+              </div>
               <button
-                type="button"
-                disabled={catalogSaving || !parsedBulkPreview?.ok}
-                onClick={handleBulkImportDevices}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-orange-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-orange-400 disabled:opacity-50"
+                type="submit"
+                disabled={catalogSaving}
+                className="rounded-lg bg-orange-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-orange-400 disabled:opacity-50"
               >
-                <Upload className="h-3.5 w-3.5" />
-                {catalogSaving ? 'Importing...' : 'Import to Master Catalog'}
+                {catalogSaving ? 'Saving...' : 'Save Device to Firestore'}
               </button>
+            </form>
+          )}
+
+          {bulkPanelOpen && (
+            <div className="rounded-xl border border-slate-800 bg-[#111622] p-5 space-y-3">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-white">Bulk Import (CSV or JSON)</h3>
+                <button
+                  type="button"
+                  onClick={() => setBulkInput(SAMPLE_CSV_BULK)}
+                  className="text-xs text-orange-400 hover:underline"
+                >
+                  Load Sample CSV
+                </button>
+              </div>
+              <textarea
+                rows={6}
+                value={bulkInput}
+                onChange={(e) => setBulkInput(e.target.value)}
+                placeholder={SAMPLE_CSV_BULK}
+                className="w-full rounded-lg border border-slate-700 bg-[#0B0E14] p-3 font-mono text-xs text-white"
+              />
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  disabled={catalogSaving}
+                  onClick={handleBulkImportDevices}
+                  className="rounded-lg bg-orange-500 px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-orange-400 disabled:opacity-50"
+                >
+                  {catalogSaving ? 'Importing...' : 'Import Devices'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setBulkPanelOpen(false)}
+                  className="rounded-lg border border-slate-700 px-4 py-2 text-xs text-slate-300"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="relative flex-1 max-w-md">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+              <input
+                type="text"
+                value={catalogSearch}
+                onChange={(e) => setCatalogSearch(e.target.value)}
+                placeholder="Search master catalog..."
+                className="w-full rounded-lg border border-slate-700 bg-[#111622] py-2 pl-9 pr-3.5 text-sm text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
+              />
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {(['all', 'samsung', 'xiaomi', 'motorola', 'vivo', 'other'] as CatalogBrandFilter[]).map(
+                (b) => (
+                  <button
+                    key={b}
+                    type="button"
+                    onClick={() => setCatalogBrandFilter(b)}
+                    className={`rounded-md px-2.5 py-1.5 text-xs font-semibold capitalize ${
+                      catalogBrandFilter === b
+                        ? 'bg-orange-500 text-slate-950'
+                        : 'border border-slate-800 bg-[#111622] text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {b}
+                  </button>
+                )
+              )}
             </div>
           </div>
-        )}
 
-        {/* Search & Brand Filters */}
-        <div className="px-6 pt-5 pb-4 flex flex-wrap items-center justify-between gap-3">
-          <div className="relative flex-1 min-w-[220px]">
-            <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
-            <input
-              type="text"
-              value={catalogSearch}
-              onChange={(e) => setCatalogSearch(e.target.value)}
-              placeholder="Search master catalog by brand, model, ID, or chipset..."
-              className="w-full rounded-lg border border-slate-800 bg-[#0B0E14] py-2 pl-9 pr-3 text-xs text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
-            />
-          </div>
-
-          <div className="flex flex-wrap items-center gap-1 rounded-lg bg-[#0B0E14] p-1 border border-slate-800">
-            {(
-              [
-                { id: 'all', label: 'All' },
-                { id: 'samsung', label: 'Samsung' },
-                { id: 'xiaomi', label: 'Xiaomi / Mi' },
-                { id: 'motorola', label: 'Motorola' },
-                { id: 'vivo', label: 'Vivo' },
-                { id: 'other', label: 'Other' },
-              ] as const
-            ).map((tab) => (
-              <button
-                key={tab.id}
-                type="button"
-                onClick={() => setCatalogBrandFilter(tab.id)}
-                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap ${
-                  catalogBrandFilter === tab.id
-                    ? 'bg-orange-500 text-slate-950 font-semibold'
-                    : 'text-slate-400 hover:text-white'
-                }`}
+          <div className="rounded-xl border border-slate-800 bg-[#111622] divide-y divide-slate-800/80">
+            {visibleCatalogRows.map((d) => (
+              <div
+                key={d.id}
+                className="flex items-center justify-between gap-3 px-4 py-3 text-xs"
               >
-                {tab.label}
-              </button>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="font-semibold text-white">
+                      {d.brand} {d.model}
+                    </span>
+                    {overriddenIdSet.has(d.id) && (
+                      <span className="rounded bg-orange-500/15 px-1.5 py-0.5 font-mono text-[10px] text-orange-300">
+                        CUSTOMIZED
+                      </span>
+                    )}
+                  </div>
+                  <p className="mt-0.5 text-slate-400">
+                    {d.ramGb} GB · {d.refreshHz} Hz · DPI {d.recommendedDpi} · {d.chipset}
+                  </p>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditingBuiltInId(d.id);
+                      setDeviceForm(deviceToFormState(d));
+                      setDeviceEditorOpen(true);
+                      setBulkPanelOpen(false);
+                    }}
+                    className="rounded-md border border-slate-700 p-1.5 text-slate-300 hover:bg-slate-800 hover:text-white"
+                    aria-label={`Edit ${d.brand} ${d.model}`}
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveCatalogDevice(d)}
+                    className="rounded-md border border-slate-700 p-1.5 text-rose-400 hover:bg-rose-950/40"
+                    aria-label={`Remove ${d.brand} ${d.model}`}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </div>
             ))}
           </div>
-        </div>
 
-        {/* Catalog Entries Table */}
-        <div className="overflow-x-auto border-t border-slate-800/80">
-          <table className="w-full min-w-[820px] text-left border-collapse">
-            <thead>
-              <tr className="border-b border-slate-800 bg-[#0B0E14] text-[11px] font-medium text-slate-400">
-                <th className="px-6 py-3">Device Model</th>
-                <th className="px-4 py-3">Hardware &amp; DPI</th>
-                <th className="px-4 py-3">0–200 Sensitivity Preset</th>
-                <th className="px-4 py-3">Fire %</th>
-                <th className="px-6 py-3 text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-800/70 text-xs">
-              {displayedCatalogDevices.length === 0 ? (
-                <tr>
-                  <td colSpan={5} className="px-6 py-10 text-center text-slate-400">
-                    No devices match this filter in the master catalog.
-                  </td>
-                </tr>
-              ) : (
-                displayedCatalogDevices.map((dev) => {
-                  const isBuiltIn = builtInIds.has(dev.id);
-                  const isEdited = upsertedIds.has(dev.id);
-                  const sens = dev.presetSensitivity;
-                  return (
-                    <tr key={dev.id} className="hover:bg-slate-800/25 transition-colors">
-                      <td className="px-6 py-3">
-                        <div className="flex items-center gap-2">
-                          <span className="font-semibold text-white">
-                            {dev.brand} {dev.model}
-                          </span>
-                          <span
-                            className={`text-[10px] font-medium ${
-                              !isBuiltIn
-                                ? 'text-orange-400'
-                                : isEdited
-                                  ? 'text-emerald-400'
-                                  : 'text-slate-500'
-                            }`}
-                          >
-                            {!isBuiltIn ? '· Added' : isEdited ? '· Edited' : '· Built-in'}
-                          </span>
-                        </div>
-                        <p className="mt-0.5 font-mono text-[11px] text-slate-500">
-                          {dev.id}
-                        </p>
-                      </td>
-                      <td className="px-4 py-3 text-slate-300">
-                        {dev.ramGb}GB · {dev.refreshHz}Hz · DPI {dev.recommendedDpi}
-                        <p className="text-[11px] text-slate-500 truncate max-w-[200px]">
-                          {dev.chipset}
-                        </p>
-                      </td>
-                      <td className="px-4 py-3 font-mono text-slate-200">
-                        {sens
-                          ? `G:${sens.general} · R:${sens.redDot} · 2x:${sens.scope2x} · 4x:${sens.scope4x} · S:${sens.sniperScope} · FL:${sens.freeLook}`
-                          : 'Dynamic formula'}
-                      </td>
-                      <td className="px-4 py-3 font-mono font-semibold text-orange-400">
-                        {dev.presetFireButton ?? 46}%
-                      </td>
-                      <td className="px-6 py-3 text-right">
-                        <div className="inline-flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => handleOpenEditDevice(dev)}
-                            className="inline-flex items-center gap-1 rounded-md border border-slate-700 px-2.5 py-1 text-xs font-medium text-slate-200 hover:border-orange-500 hover:text-white transition-colors"
-                          >
-                            <Pencil className="h-3 w-3" />
-                            Edit
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveMasterDevice(dev)}
-                            aria-label={`Remove ${dev.brand} ${dev.model}`}
-                            className="flex h-7 w-7 items-center justify-center rounded-md border border-slate-800 text-slate-400 hover:bg-rose-950/50 hover:text-rose-400 transition-colors"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-
-        {filteredMasterDevices.length > 20 && catalogSearch.trim().length === 0 && (
-          <div className="border-t border-slate-800/80 px-6 py-3 flex items-center justify-between text-xs text-slate-400">
-            <span>
-              Showing {displayedCatalogDevices.length} of {filteredMasterDevices.length} devices
-            </span>
+          {!catalogShowAll && filteredMasterCatalog.length > 20 && (
             <button
               type="button"
-              onClick={() => setCatalogShowAll((prev) => !prev)}
-              className="font-medium text-orange-400 hover:underline"
+              onClick={() => setCatalogShowAll(true)}
+              className="w-full rounded-lg border border-slate-800 bg-[#111622] py-2.5 text-xs font-semibold text-slate-300 hover:text-white"
             >
-              {catalogShowAll
-                ? 'Show First 20'
-                : `Show All (${filteredMasterDevices.length})`}
+              Show All {filteredMasterCatalog.length} Devices
             </button>
-          </div>
-        )}
-      </section>
-
-      {/* Create Custom Customer ID & Password Card */}
-      <section className="rounded-xl border border-slate-800/90 bg-[#111622] p-6">
-        <div className="border-b border-slate-800/80 pb-4">
-          <div className="flex items-center gap-2">
-            <Shield className="h-4 w-4 text-orange-400" />
-            <h2 className="text-lg font-semibold text-white">
-              Create Custom Customer ID &amp; Password
-            </h2>
-          </div>
-          <p className="mt-1 text-xs text-slate-400">
-            Directly issue custom Customer ID credentials with a pre-assigned device profile. Passwords are salted and hashed on the server.
-          </p>
+          )}
         </div>
-
-        {createdBanner && (
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-emerald-500/40 bg-emerald-950/20 px-4 py-3">
-            <div className="text-xs">
-              <p className="font-semibold text-emerald-400">
-                User Access Granted
-              </p>
-              <p className="mt-0.5 font-mono text-slate-200">
-                {createdBanner.email ? `Email: ${createdBanner.email} · ` : ''}ID: {createdBanner.customId} · Password: {createdBanner.password}
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={handleCopyCredentials}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 transition-colors"
-            >
-              {copiedCreds ? (
-                <>
-                  <Check className="h-3.5 w-3.5" />
-                  Copied
-                </>
-              ) : (
-                <>
-                  <Copy className="h-3.5 w-3.5" />
-                  Copy Credentials
-                </>
-              )}
-            </button>
-          </div>
-        )}
-
-        <form onSubmit={handleCreateCustomer} className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-12">
-          <div className="md:col-span-3">
-            <label htmlFor="cust-email" className="block text-xs font-medium text-slate-300">
-              Email ID
-            </label>
-            <input
-              id="cust-email"
-              type="email"
-              value={customerEmail}
-              onChange={(e) => setCustomerEmail(e.target.value)}
-              placeholder="player@gmail.com"
-              className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2.5 text-sm font-mono text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
-            />
-          </div>
-
-          <div className="md:col-span-2">
-            <label htmlFor="cust-id" className="block text-xs font-medium text-slate-300">
-              User ID (Opt.)
-            </label>
-            <input
-              id="cust-id"
-              type="text"
-              value={customId}
-              onChange={(e) => setCustomId(e.target.value)}
-              placeholder="Auto"
-              className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2.5 text-sm font-mono text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
-            />
-          </div>
-
-          <div className="md:col-span-2">
-            <label htmlFor="cust-name" className="block text-xs font-medium text-slate-300">
-              Player Name
-            </label>
-            <input
-              id="cust-name"
-              type="text"
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              placeholder="Optional name"
-              className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
-            />
-          </div>
-
-          <div className="md:col-span-2">
-            <div className="flex items-center justify-between">
-              <label htmlFor="cust-pass" className="block text-xs font-medium text-slate-300">
-                Password
-              </label>
-              <button
-                type="button"
-                onClick={generatePassword}
-                className="text-[11px] font-medium text-orange-400 hover:underline"
-              >
-                Generate
-              </button>
-            </div>
-            <input
-              id="cust-pass"
-              type="text"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="Min 4 chars"
-              className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2.5 text-sm font-mono text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
-            />
-          </div>
-
-          <div className="md:col-span-3">
-            <label htmlFor="cust-device" className="block text-xs font-medium text-slate-300">
-              Assigned Device
-            </label>
-            <select
-              id="cust-device"
-              value={assignedDeviceId}
-              onChange={(e) => setAssignedDeviceId(e.target.value)}
-              className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2.5 text-sm text-white focus:border-orange-500 focus:outline-none"
-            >
-              {devices.map((d) => (
-                <option key={d.id} value={d.id}>
-                  {d.brand} {d.model}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div className="md:col-span-12 flex justify-end pt-1">
-            <button
-              type="submit"
-              disabled={creating}
-              className="inline-flex items-center gap-2 rounded-lg bg-orange-500 px-4 py-2.5 text-xs font-semibold text-slate-950 hover:bg-orange-400 disabled:opacity-60 transition-colors"
-            >
-              <Plus className="h-4 w-4" />
-              {creating ? 'Creating...' : 'Create Customer Account'}
-            </button>
-          </div>
-        </form>
-      </section>
-
-      {/* Customer Directory Table */}
-      <section className="rounded-xl border border-slate-800/90 bg-[#111622] overflow-hidden">
-        <div className="flex items-center justify-between border-b border-slate-800/80 px-6 py-4">
-          <div>
-            <h3 className="text-base font-semibold text-white">
-              Registered Customer IDs
-            </h3>
-            <p className="mt-0.5 text-xs text-slate-400">
-              {customers.length} customer {customers.length === 1 ? 'account' : 'accounts'} configured
-            </p>
-          </div>
-        </div>
-
-        {loading ? (
-          <div className="px-6 py-12 text-center text-xs text-slate-400">
-            Loading customer directory...
-          </div>
-        ) : customers.length === 0 ? (
-          <div className="px-6 py-14 text-center">
-            <p className="text-sm font-medium text-white">No Customer IDs Created Yet</p>
-            <p className="mt-1 text-xs text-slate-400">
-              Accept a pending customer request or use the form above to create a Customer ID and password.
-            </p>
-          </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[760px] text-left border-collapse">
-              <thead>
-                <tr className="border-b border-slate-800 text-[11px] font-medium text-slate-400">
-                  <th className="px-6 py-3">Customer ID</th>
-                  <th className="px-4 py-3">Assigned Device</th>
-                  <th className="px-4 py-3">Status</th>
-                  <th className="px-4 py-3">Last Login</th>
-                  <th className="px-6 py-3 text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/70 text-sm">
-                {customers.map((c) => {
-                  const dev = devices.find((d) => d.id === c.assignedDeviceId);
-                  return (
-                    <React.Fragment key={c.id}>
-                      <tr className="hover:bg-slate-800/30 transition-colors">
-                        <td className="px-6 py-3.5">
-                          <p className="font-mono font-semibold text-white">
-                            {c.email || c.customId}
-                          </p>
-                          <p className="mt-0.5 text-xs text-slate-400">
-                            {c.email ? `@${c.customId} · ` : ''}{c.displayName}
-                          </p>
-                        </td>
-                        <td className="px-4 py-3.5 text-xs text-slate-300">
-                          {dev ? `${dev.brand} ${dev.model}` : c.assignedDeviceId}
-                        </td>
-                        <td className="px-4 py-3.5 text-xs font-medium">
-                          <span className={c.active ? 'text-emerald-400' : 'text-rose-400'}>
-                            {c.active ? 'Active' : 'Suspended'}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3.5 font-mono text-xs text-slate-400">
-                          {c.lastLoginAt
-                            ? new Date(c.lastLoginAt).toLocaleDateString()
-                            : 'Never'}
-                        </td>
-                        <td className="px-6 py-3.5 text-right">
-                          <div className="inline-flex items-center gap-2">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setResetTargetId(resetTargetId === c.id ? null : c.id);
-                                setResetPasswordVal('');
-                              }}
-                              className="inline-flex items-center gap-1 rounded-md border border-slate-700 px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:border-orange-500 hover:text-white transition-colors"
-                            >
-                              <KeyRound className="h-3 w-3" />
-                              Reset Pass
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleToggleActive(c)}
-                              className="inline-flex items-center gap-1 rounded-md border border-slate-700 px-2.5 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white transition-colors"
-                            >
-                              <UserX className="h-3 w-3" />
-                              {c.active ? 'Suspend' : 'Activate'}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteCustomer(c.id)}
-                              aria-label={`Delete ${c.customId}`}
-                              className="flex h-8 w-8 items-center justify-center rounded-md border border-slate-800 text-slate-400 hover:bg-rose-950/50 hover:text-rose-400 transition-colors"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                      {resetTargetId === c.id && (
-                        <tr className="bg-[#0B0E14]">
-                          <td colSpan={5} className="px-6 py-3">
-                            <div className="flex flex-wrap items-center justify-end gap-3">
-                              <span className="text-xs text-slate-400">
-                                New password for <strong className="font-mono text-white">{c.customId}</strong>:
-                              </span>
-                              <input
-                                type="text"
-                                value={resetPasswordVal}
-                                onChange={(e) => setResetPasswordVal(e.target.value)}
-                                placeholder="Min 4 chars"
-                                className="rounded-md border border-slate-700 bg-[#111622] px-3 py-1.5 text-xs font-mono text-white focus:border-orange-500 focus:outline-none"
-                              />
-                              <button
-                                type="button"
-                                onClick={() => handleSavePasswordReset(c.id)}
-                                className="rounded-md bg-orange-500 px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-orange-400"
-                              >
-                                Save Password
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => setResetTargetId(null)}
-                                className="rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-800"
-                              >
-                                Cancel
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                    </React.Fragment>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
-
-      {/* Admin Accounts (Full Access) */}
-      <section className="rounded-xl border border-slate-800/90 bg-[#111622] p-6">
-        <div className="border-b border-slate-800/80 pb-4">
-          <div className="flex items-center gap-2">
-            <ShieldCheck className="h-4 w-4 text-orange-400" />
-            <h2 className="text-lg font-semibold text-white">
-              Admin Accounts (Full Access)
-            </h2>
-          </div>
-          <p className="mt-1 text-xs text-slate-400">
-            Create or manage full-access administrator IDs with access to all tabs, customer requests, and credentials.
-          </p>
-        </div>
-
-        {adminCreatedBanner && (
-          <div className="mt-4 rounded-lg border border-emerald-500/40 bg-emerald-950/20 px-4 py-2.5 text-xs text-emerald-300">
-            {adminCreatedBanner}
-          </div>
-        )}
-
-        <form
-          onSubmit={handleCreateAdminAccount}
-          className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4"
-        >
-          <div>
-            <label htmlFor="new-adm-id" className="block text-xs font-medium text-slate-300">
-              Admin ID
-            </label>
-            <input
-              id="new-adm-id"
-              type="text"
-              value={newAdmAccountId}
-              onChange={(e) => setNewAdmAccountId(e.target.value)}
-              placeholder="e.g. admin_lead"
-              className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2.5 text-sm font-mono text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
-            />
-          </div>
-
-          <div>
-            <label htmlFor="new-adm-name" className="block text-xs font-medium text-slate-300">
-              Display Name
-            </label>
-            <input
-              id="new-adm-name"
-              type="text"
-              value={newAdmAccountName}
-              onChange={(e) => setNewAdmAccountName(e.target.value)}
-              placeholder="Optional label"
-              className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
-            />
-          </div>
-
-          <div>
-            <label htmlFor="new-adm-pass" className="block text-xs font-medium text-slate-300">
-              Password
-            </label>
-            <input
-              id="new-adm-pass"
-              type="password"
-              value={newAdmAccountPass}
-              onChange={(e) => setNewAdmAccountPass(e.target.value)}
-              placeholder="Min 6 characters"
-              className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
-            />
-          </div>
-
-          <div className="flex items-end">
-            <button
-              type="submit"
-              disabled={creatingAdmin}
-              className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-orange-500 px-4 py-2.5 text-xs font-semibold text-slate-950 hover:bg-orange-400 disabled:opacity-60 transition-colors"
-            >
-              <Plus className="h-4 w-4" />
-              {creatingAdmin ? 'Creating...' : 'Add Admin ID'}
-            </button>
-          </div>
-        </form>
-
-        {admins.length > 0 && (
-          <div className="mt-5 overflow-x-auto rounded-lg border border-slate-800/80">
-            <table className="w-full min-w-[640px] text-left border-collapse">
-              <thead>
-                <tr className="border-b border-slate-800 bg-[#0B0E14] text-[11px] font-medium text-slate-400">
-                  <th className="px-4 py-2.5">Admin ID</th>
-                  <th className="px-4 py-2.5">Permissions</th>
-                  <th className="px-4 py-2.5">Status</th>
-                  <th className="px-4 py-2.5 text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/70 text-xs">
-                {admins.map((adm) => {
-                  const isSelf = adm.customId.toLowerCase() === currentAdminId.toLowerCase();
-                  return (
-                    <tr key={adm.id} className="hover:bg-slate-800/25">
-                      <td className="px-4 py-3">
-                        <p className="font-mono text-sm font-semibold text-white">
-                          {adm.customId}
-                          {isSelf && (
-                            <span className="ml-2 text-[11px] font-sans font-medium text-orange-400">
-                              (Current)
-                            </span>
-                          )}
-                        </p>
-                        <p className="text-[11px] text-slate-400">{adm.displayName}</p>
-                      </td>
-                      <td className="px-4 py-3 text-slate-300">
-                        Full Admin Access
-                      </td>
-                      <td className="px-4 py-3 font-medium">
-                        <span className={adm.active ? 'text-emerald-400' : 'text-rose-400'}>
-                          {adm.active ? 'Active' : 'Suspended'}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        <div className="inline-flex items-center gap-2">
-                          <button
-                            type="button"
-                            disabled={isSelf}
-                            onClick={() => handleToggleAdminActive(adm)}
-                            className="rounded-md border border-slate-700 px-2.5 py-1 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40 transition-colors"
-                          >
-                            {adm.active ? 'Suspend' : 'Activate'}
-                          </button>
-                          <button
-                            type="button"
-                            disabled={isSelf}
-                            onClick={() => handleDeleteAdminAccount(adm.id)}
-                            aria-label={`Delete admin ${adm.customId}`}
-                            className="flex h-7 w-7 items-center justify-center rounded-md border border-slate-800 text-slate-400 hover:bg-rose-950/50 hover:text-rose-400 disabled:opacity-40 transition-colors"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
-
-      {/* Admin ID & Password Reset */}
-      <section className="rounded-xl border border-slate-800/90 bg-[#111622] p-6">
-        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800/80 pb-4">
-          <div>
-            <div className="flex items-center gap-2">
-              <KeyRound className="h-4 w-4 text-orange-400" />
-              <h2 className="text-lg font-semibold text-white">
-                Reset Admin ID &amp; Password
-              </h2>
-            </div>
-            <p className="mt-1 text-xs text-slate-400">
-              {envOverrideActive && currentUserId === 'admin-root'
-                ? 'Root admin credentials are currently controlled by ADMIN_ID / ADMIN_PASSCODE in Settings → Secrets. Create a named Admin ID above to manage a separate password in the dashboard.'
-                : 'Update your Admin ID and password, or reset back to First-Run Setup.'}
-            </p>
-          </div>
-
-          {!(envOverrideActive && currentUserId === 'admin-root') && (!confirmResetClaim ? (
-            <button
-              type="button"
-              onClick={() => {
-                setConfirmResetClaim(true);
-                setError(null);
-              }}
-              className="rounded-lg border border-slate-700 px-3.5 py-2 text-xs font-medium text-slate-300 hover:border-rose-500/50 hover:text-rose-300 transition-colors"
-            >
-              Reset to First-Run Setup
-            </button>
-          ) : (
-            <div className="flex flex-wrap items-center gap-2">
-              <input
-                type="password"
-                value={adminCurrentPass}
-                onChange={(e) => setAdminCurrentPass(e.target.value)}
-                placeholder="Confirm current password"
-                className="rounded-md border border-slate-700 bg-[#0B0E14] px-3 py-1.5 text-xs text-white focus:border-rose-500 focus:outline-none"
-              />
-              <button
-                type="button"
-                onClick={async () => {
-                  setError(null);
-                  try {
-                    const res = await fetch('/api/admin/credentials/reset-claim', {
-                      method: 'POST',
-                      headers: {
-                        'Content-Type': 'application/json',
-                        Authorization: `Bearer ${token}`,
-                      },
-                      body: JSON.stringify({ currentPassword: adminCurrentPass }),
-                    });
-                    const data = await res.json();
-                    if (!res.ok) {
-                      setError(data?.error || 'Could not reset admin claim.');
-                      return;
-                    }
-                    onResetAdminClaim();
-                  } catch {
-                    setError('Network error resetting admin credentials.');
-                  }
-                }}
-                className="rounded-md bg-rose-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-rose-400"
-              >
-                Confirm Reset &amp; Sign Out
-              </button>
-              <button
-                type="button"
-                onClick={() => setConfirmResetClaim(false)}
-                className="rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-800"
-              >
-                Cancel
-              </button>
-            </div>
-          ))}
-        </div>
-
-        {adminSuccess && (
-          <div className="mt-4 rounded-lg border border-emerald-500/40 bg-emerald-950/20 px-4 py-2.5 text-xs text-emerald-300">
-            {adminSuccess}
-          </div>
-        )}
-
-        {envOverrideActive && currentUserId === 'admin-root' ? (
-          <div className="mt-4 rounded-lg border border-slate-800 bg-[#0B0E14] px-4 py-3 text-xs text-slate-400">
-            To change the root secret password, edit <span className="font-mono text-slate-200">ADMIN_ID</span> / <span className="font-mono text-slate-200">ADMIN_PASSCODE</span> in Settings → Secrets, or add a named Full-Access Admin ID in the section above.
-          </div>
-        ) : (
-        <form
-          onSubmit={async (e) => {
-            e.preventDefault();
-            setError(null);
-            setAdminSuccess(null);
-            if (!adminCurrentPass) {
-              setError('Enter your current admin password.');
-              return;
-            }
-            if (newAdminPass.length < 6) {
-              setError('New admin password must be at least 6 characters.');
-              return;
-            }
-            if (newAdminPass !== confirmAdminPass) {
-              setError('New admin passwords do not match.');
-              return;
-            }
-
-            setAdminSaving(true);
-            try {
-              const res = await fetch('/api/admin/credentials', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  Authorization: `Bearer ${token}`,
-                },
-                body: JSON.stringify({
-                  currentPassword: adminCurrentPass,
-                  newAdminId: newAdminId.trim(),
-                  newPassword: newAdminPass,
-                }),
-              });
-              const data = await res.json();
-              if (!res.ok) {
-                setError(data?.error || 'Could not update admin credentials.');
-                return;
-              }
-              onAdminCredentialsUpdated(data.token, data.user);
-              setAdminCurrentPass('');
-              setNewAdminPass('');
-              setConfirmAdminPass('');
-              setAdminSuccess(`Admin credentials updated for "${data.user.customId}".`);
-            } catch {
-              setError('Network error updating admin credentials.');
-            } finally {
-              setAdminSaving(false);
-            }
-          }}
-          className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4"
-        >
-          <div>
-            <label htmlFor="adm-cur-pass" className="block text-xs font-medium text-slate-300">
-              Current Password
-            </label>
-            <input
-              id="adm-cur-pass"
-              type="password"
-              value={adminCurrentPass}
-              onChange={(e) => setAdminCurrentPass(e.target.value)}
-              placeholder="Current admin password"
-              className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
-            />
-          </div>
-
-          <div>
-            <label htmlFor="adm-new-id" className="block text-xs font-medium text-slate-300">
-              New Admin ID
-            </label>
-            <input
-              id="adm-new-id"
-              type="text"
-              value={newAdminId}
-              onChange={(e) => setNewAdminId(e.target.value)}
-              placeholder="e.g. admin"
-              className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2.5 text-sm font-mono text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
-            />
-          </div>
-
-          <div>
-            <label htmlFor="adm-new-pass" className="block text-xs font-medium text-slate-300">
-              New Password
-            </label>
-            <input
-              id="adm-new-pass"
-              type="password"
-              value={newAdminPass}
-              onChange={(e) => setNewAdminPass(e.target.value)}
-              placeholder="Min 6 characters"
-              className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
-            />
-          </div>
-
-          <div>
-            <label htmlFor="adm-conf-pass" className="block text-xs font-medium text-slate-300">
-              Confirm Password
-            </label>
-            <input
-              id="adm-conf-pass"
-              type="password"
-              value={confirmAdminPass}
-              onChange={(e) => setConfirmAdminPass(e.target.value)}
-              placeholder="Re-enter password"
-              className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
-            />
-          </div>
-
-          <div className="sm:col-span-2 lg:col-span-4 flex justify-end">
-            <button
-              type="submit"
-              disabled={adminSaving}
-              className="rounded-lg bg-orange-500 px-4 py-2.5 text-xs font-semibold text-slate-950 hover:bg-orange-400 disabled:opacity-60 transition-colors"
-            >
-              {adminSaving ? 'Updating...' : 'Save New Admin ID & Password'}
-            </button>
-          </div>
-        </form>
-        )}
-      </section>
+      )}
     </div>
   );
 };

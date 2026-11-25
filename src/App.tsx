@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bookmark,
   Crosshair,
@@ -10,7 +10,18 @@ import {
   Sliders,
   X,
 } from 'lucide-react';
+import { onAuthStateChanged, type User } from 'firebase/auth';
+import {
+  collection,
+  doc,
+  onSnapshot,
+  query,
+  serverTimestamp,
+  updateDoc,
+  where,
+} from 'firebase/firestore';
 import { AdminPanelView } from './components/AdminPanelView';
+import { ApprovalStatusView } from './components/ApprovalStatusView';
 import { BrandLogo } from './components/BrandLogo';
 import { CustomDeviceModal } from './components/CustomDeviceModal';
 import { DeviceSensitivityView } from './components/DeviceSensitivityView';
@@ -20,17 +31,32 @@ import { LoginView } from './components/LoginView';
 import { PerformanceBoosterView } from './components/PerformanceBoosterView';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { SavedProfilesView } from './components/SavedProfilesView';
+import {
+  ADMIN_EMAIL,
+  auth,
+  db,
+  handleFirestoreError,
+  isAdminUser,
+  logUserAction,
+  mapUserDoc,
+  OperationType,
+  signOutFirebase,
+  syncUserOnSignIn,
+} from './firebase';
 import { DEVICE_CATALOG, PLAYSTYLE_META, mergeMasterCatalog } from './utils/devices';
 import {
-  AuthUser,
   CatalogOverrides,
   DeviceSpec,
+  DeviceTier,
+  FirebaseUserProfile,
   GripType,
   NotificationBlockSettings,
+  OperatingSystem,
   PlaystyleId,
   RangeBias,
   SavedProfile,
   SensitivityValues,
+  UserActionType,
 } from './types';
 import {
   buildOptimizationChecklist,
@@ -38,7 +64,7 @@ import {
   formatSetupAsText,
 } from './utils/calibration';
 
-type ActiveTab = 'sensitivity' | 'performance' | 'drag-lab' | 'saved' | 'admin';
+type ActiveTab = 'sensitivity' | 'performance' | 'drag-lab' | 'saved';
 
 const STORAGE_KEYS = {
   customDevices: 'firetune_custom_devices_v1',
@@ -67,10 +93,31 @@ const BASE_NAV_ITEMS: {
 ];
 
 export default function App() {
-  // Bearer session held strictly in React/JS memory (backed by HttpOnly session cookie across reloads)
-  const [authToken, setAuthToken] = useState<string | null>(null);
-  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [pathname, setPathname] = useState<string>(() =>
+    typeof window !== 'undefined' ? window.location.pathname : '/'
+  );
+  const isAdminRoute = pathname === '/admin' || pathname.startsWith('/admin/');
+
+  const navigateTo = useCallback((nextPath: string) => {
+    if (typeof window !== 'undefined' && window.location.pathname !== nextPath) {
+      window.history.pushState({}, '', nextPath);
+    }
+    setPathname(nextPath);
+  }, []);
+
+  useEffect(() => {
+    const onPopState = () => {
+      setPathname(window.location.pathname);
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  const [userProfile, setUserProfile] = useState<FirebaseUserProfile | null>(null);
   const [authChecking, setAuthChecking] = useState(true);
+  const [refreshingStatus, setRefreshingStatus] = useState(false);
+  const syncedSessionUidRef = useRef<string | null>(null);
 
   const [activeTab, setActiveTab] = useState<ActiveTab>('sensitivity');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -78,13 +125,13 @@ export default function App() {
   const [launchModalOpen, setLaunchModalOpen] = useState(false);
   const [appliedStepsCount, setAppliedStepsCount] = useState(0);
   const [autoCopied, setAutoCopied] = useState(false);
-  const [pendingRequestCount, setPendingRequestCount] = useState(0);
+  const [pendingUsersCount, setPendingUsersCount] = useState(0);
   const pendingProfileOverrideRef = useRef<{
     sensitivity: SensitivityValues;
     fireButtonSize: number;
   } | null>(null);
+  const sensitivityLogTimerRef = useRef<number | null>(null);
 
-  // Persisted custom devices
   const [customDevices, setCustomDevices] = useState<DeviceSpec[]>(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEYS.customDevices);
@@ -94,7 +141,6 @@ export default function App() {
     }
   });
 
-  // Persisted saved profiles
   const [savedProfiles, setSavedProfiles] = useState<SavedProfile[]>(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEYS.savedProfiles);
@@ -104,7 +150,6 @@ export default function App() {
     }
   });
 
-  // Persisted optimization checklist completion by device id
   const [checklistMap, setChecklistMap] = useState<Record<string, string[]>>(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEYS.checklistMap);
@@ -114,7 +159,6 @@ export default function App() {
     }
   });
 
-  // Persisted notification block preferences
   const [notificationBlock, setNotificationBlock] = useState<NotificationBlockSettings>(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEYS.notificationBlock);
@@ -142,7 +186,11 @@ export default function App() {
   );
 
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>(
-    () => allDevices.find((d) => d.id === 'samsung-a54')?.id ?? allDevices.find((d) => d.id === 'redmi-note-12')?.id ?? allDevices[0]?.id ?? DEVICE_CATALOG[0].id
+    () =>
+      allDevices.find((d) => d.id === 'samsung-a54')?.id ??
+      allDevices.find((d) => d.id === 'redmi-note-12')?.id ??
+      allDevices[0]?.id ??
+      DEVICE_CATALOG[0].id
   );
   const [playstyle, setPlaystyle] = useState<PlaystyleId>('one-tap');
   const [grip, setGrip] = useState<GripType>('2-finger');
@@ -164,7 +212,6 @@ export default function App() {
     calibration.fireButtonSize
   );
 
-  // Sync slider overrides when device/playstyle/grip/range changes (unless loading a saved preset)
   useEffect(() => {
     if (pendingProfileOverrideRef.current) {
       const pending = pendingProfileOverrideRef.current;
@@ -177,63 +224,130 @@ export default function App() {
     setFireButtonOverride(calibration.fireButtonSize);
   }, [calibration]);
 
-  // Restore session and load admin master catalog overrides on page reload or PWA relaunch
+  // Listen to Firebase Auth state
   useEffect(() => {
-    let active = true;
-    const bootstrapWorkspace = async () => {
-      try {
-        const [sessionRes, catalogRes] = await Promise.all([
-          fetch('/api/auth/session', { credentials: 'same-origin' }),
-          fetch('/api/catalog/overrides'),
-        ]);
-
-        let latestMaster = DEVICE_CATALOG;
-        const catalogType = catalogRes.headers.get('content-type') || '';
-        if (catalogRes.ok && catalogType.includes('application/json') && active) {
-          const catalogData = (await catalogRes.json()) as Partial<CatalogOverrides>;
-          const normalized: CatalogOverrides = {
-            upsertedDevices: Array.isArray(catalogData.upsertedDevices)
-              ? catalogData.upsertedDevices
-              : [],
-            removedIds: Array.isArray(catalogData.removedIds)
-              ? catalogData.removedIds
-              : [],
-          };
-          setCatalogOverrides(normalized);
-          latestMaster = mergeMasterCatalog(DEVICE_CATALOG, normalized);
-        }
-
-        const contentType = sessionRes.headers.get('content-type') || '';
-        if (sessionRes.ok && contentType.includes('application/json') && active) {
-          const data = (await sessionRes.json()) as {
-            authenticated?: boolean;
-            token?: string | null;
-            user?: AuthUser | null;
-          };
-          if (data.authenticated && data.token && data.user) {
-            setAuthToken(data.token);
-            setAuthUser(data.user);
-            const mergedAvailable = [...customDevices, ...latestMaster];
-            if (
-              data.user.assignedDeviceId &&
-              mergedAvailable.some((d) => d.id === data.user?.assignedDeviceId)
-            ) {
-              setSelectedDeviceId(data.user.assignedDeviceId);
-            }
-            setActiveTab(data.user.role === 'admin' ? 'admin' : 'sensitivity');
-          }
-        }
-      } catch {
-        // Ignore unauthenticated startup
-      } finally {
-        if (active) setAuthChecking(false);
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (!user) {
+        syncedSessionUidRef.current = null;
+        setFirebaseUser(null);
+        setUserProfile(null);
+        setPendingUsersCount(0);
+        setAuthChecking(false);
+        return;
       }
-    };
-    bootstrapWorkspace();
-    return () => {
-      active = false;
-    };
+
+      setFirebaseUser(user);
+      if (syncedSessionUidRef.current !== user.uid) {
+        syncedSessionUidRef.current = user.uid;
+        try {
+          const synced = await syncUserOnSignIn(user, selectedDeviceId);
+          setUserProfile(synced);
+          if (
+            synced.requestedDeviceId &&
+            allDevices.some((d) => d.id === synced.requestedDeviceId)
+          ) {
+            setSelectedDeviceId(synced.requestedDeviceId);
+          }
+        } catch (err) {
+          console.error('Failed syncing Firebase user profile on auth restore:', err);
+        }
+      }
+      setAuthChecking(false);
+    });
+    return () => unsubscribe();
   }, []);
+
+  // Subscribe to own user profile in Firestore so pending/approved/blocked transitions happen live
+  useEffect(() => {
+    if (!firebaseUser) return;
+    const userPath = `users/${firebaseUser.uid}`;
+    const unsubscribe = onSnapshot(
+      doc(db, 'users', firebaseUser.uid),
+      (snap) => {
+        if (snap.exists()) {
+          setUserProfile(mapUserDoc(firebaseUser.uid, snap.data() as Record<string, unknown>));
+        }
+      },
+      (err) => {
+        handleFirestoreError(err, OperationType.GET, userPath);
+      }
+    );
+    return () => unsubscribe();
+  }, [firebaseUser]);
+
+  // Subscribe to Firestore device catalog overrides once authenticated
+  useEffect(() => {
+    if (!firebaseUser || !firebaseUser.emailVerified) return;
+    const unsubscribe = onSnapshot(
+      collection(db, 'catalogDevices'),
+      (snap) => {
+        const upsertedDevices: DeviceSpec[] = [];
+        const removedIds: string[] = [];
+        for (const docSnap of snap.docs) {
+          const data = docSnap.data() as Record<string, unknown>;
+          const id = typeof data.id === 'string' ? data.id : docSnap.id;
+          if (data.removed === true) {
+            removedIds.push(id);
+            continue;
+          }
+          upsertedDevices.push({
+            id,
+            brand: typeof data.brand === 'string' ? data.brand : 'Custom',
+            model: typeof data.model === 'string' ? data.model : 'Device',
+            tier: (typeof data.tier === 'string' ? data.tier : 'mid') as DeviceTier,
+            os: (typeof data.os === 'string' ? data.os : 'Android') as OperatingSystem,
+            ramGb: typeof data.ramGb === 'number' ? data.ramGb : 8,
+            refreshHz: typeof data.refreshHz === 'number' ? data.refreshHz : 120,
+            touchSamplingHz:
+              typeof data.touchSamplingHz === 'number' ? data.touchSamplingHz : 240,
+            ppi: typeof data.ppi === 'number' ? data.ppi : 400,
+            screenInches: typeof data.screenInches === 'number' ? data.screenInches : 6.67,
+            chipset:
+              typeof data.chipset === 'string'
+                ? data.chipset
+                : 'Snapdragon / Dimensity',
+            defaultDpi: typeof data.defaultDpi === 'number' ? data.defaultDpi : 392,
+            recommendedDpi:
+              typeof data.recommendedDpi === 'number' ? data.recommendedDpi : 510,
+            thermalHeadroom: (typeof data.thermalHeadroom === 'string'
+              ? data.thermalHeadroom
+              : 'Moderate') as 'Tight' | 'Moderate' | 'High',
+            presetSensitivity:
+              data.presetSensitivity && typeof data.presetSensitivity === 'object'
+                ? (data.presetSensitivity as SensitivityValues)
+                : undefined,
+            presetFireButton:
+              typeof data.presetFireButton === 'number' ? data.presetFireButton : undefined,
+          });
+        }
+        setCatalogOverrides({ upsertedDevices, removedIds });
+      },
+      (err) => {
+        handleFirestoreError(err, OperationType.LIST, 'catalogDevices');
+      }
+    );
+    return () => unsubscribe();
+  }, [firebaseUser]);
+
+  // Live pending count badge for pucuz999@gmail.com
+  const isVerifiedAdmin = isAdminUser(firebaseUser);
+  useEffect(() => {
+    if (!firebaseUser || !isVerifiedAdmin) {
+      setPendingUsersCount(0);
+      return;
+    }
+    const q = query(collection(db, 'users'), where('status', '==', 'pending'));
+    const unsubscribe = onSnapshot(
+      q,
+      (snap) => {
+        setPendingUsersCount(snap.size);
+      },
+      (err) => {
+        handleFirestoreError(err, OperationType.LIST, 'users');
+      }
+    );
+    return () => unsubscribe();
+  }, [firebaseUser, isVerifiedAdmin]);
 
   useEffect(() => {
     try {
@@ -270,10 +384,67 @@ export default function App() {
     }
   }, [notificationBlock]);
 
+  const recordAction = useCallback(
+    (action: UserActionType, details: string) => {
+      if (!firebaseUser || !userProfile) return;
+      void logUserAction(firebaseUser, action, details);
+    },
+    [firebaseUser, userProfile]
+  );
+
+  const handleAuthComplete = (user: User, profile: FirebaseUserProfile) => {
+    syncedSessionUidRef.current = user.uid;
+    setFirebaseUser(user);
+    setUserProfile(profile);
+    if (
+      profile.requestedDeviceId &&
+      allDevices.some((d) => d.id === profile.requestedDeviceId)
+    ) {
+      setSelectedDeviceId(profile.requestedDeviceId);
+    }
+  };
+
+  const handleRefreshProfile = async () => {
+    if (!firebaseUser) return;
+    setRefreshingStatus(true);
+    try {
+      const fresh = await syncUserOnSignIn(firebaseUser, selectedDeviceId);
+      setUserProfile(fresh);
+    } finally {
+      setRefreshingStatus(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    await signOutFirebase(firebaseUser);
+    syncedSessionUidRef.current = null;
+    setFirebaseUser(null);
+    setUserProfile(null);
+    setPendingUsersCount(0);
+    setActiveTab('sensitivity');
+    setMobileMenuOpen(false);
+    if (isAdminRoute) {
+      navigateTo('/');
+    }
+  };
+
+  const handleSelectDevice = (device: DeviceSpec) => {
+    setSelectedDeviceId(device.id);
+    recordAction('select_device', `Selected ${device.brand} ${device.model}`);
+    if (firebaseUser && userProfile) {
+      const path = `users/${firebaseUser.uid}`;
+      void updateDoc(doc(db, 'users', firebaseUser.uid), {
+        requestedDeviceId: device.id.slice(0, 64),
+        updatedAt: serverTimestamp(),
+      }).catch((err) => handleFirestoreError(err, OperationType.UPDATE, path));
+    }
+  };
+
   const handleSaveCustomDevice = (device: DeviceSpec) => {
     setCustomDevices((prev) => [device, ...prev]);
     setSelectedDeviceId(device.id);
     setActiveTab('sensitivity');
+    recordAction('select_device', `Added custom device ${device.brand} ${device.model}`);
   };
 
   const handleSaveProfile = (name: string) => {
@@ -298,6 +469,10 @@ export default function App() {
       notes: '',
     };
     setSavedProfiles((prev) => [newProfile, ...prev]);
+    recordAction(
+      'save_preset',
+      `Saved preset "${name}" for ${selectedDevice.brand} ${selectedDevice.model}`
+    );
   };
 
   const handleLoadProfile = (profile: SavedProfile) => {
@@ -324,6 +499,8 @@ export default function App() {
       setRangeBias(profile.rangeBias);
     }
     setActiveTab('sensitivity');
+    navigateTo('/');
+    recordAction('view_tab', `Loaded preset "${profile.name}"`);
   };
 
   const handleToggleChecklistStep = (stepId: string) => {
@@ -333,83 +510,38 @@ export default function App() {
       const next = exists
         ? current.filter((id) => id !== stepId)
         : [...current, stepId];
+      recordAction(
+        'toggle_optimization',
+        `${exists ? 'Unchecked' : 'Enabled'} optimization step "${stepId}" on ${selectedDevice.brand} ${selectedDevice.model}`
+      );
       return { ...prev, [selectedDevice.id]: next };
     });
   };
 
   const handleResetChecklist = () => {
     setChecklistMap((prev) => ({ ...prev, [selectedDevice.id]: [] }));
+    recordAction(
+      'toggle_optimization',
+      `Reset FPS checklist for ${selectedDevice.brand} ${selectedDevice.model}`
+    );
   };
 
-  const navItems = useMemo(() => {
-    if (authUser?.role === 'admin') {
-      return [
-        ...BASE_NAV_ITEMS,
-        { id: 'admin' as const, label: 'Admin & Requests', icon: ShieldCheck },
-      ];
+  const handleSensitivityChange = (key: keyof SensitivityValues, value: number) => {
+    setSensitivityOverrides((prev) => ({ ...prev, [key]: value }));
+    if (sensitivityLogTimerRef.current) {
+      window.clearTimeout(sensitivityLogTimerRef.current);
     }
-    return BASE_NAV_ITEMS;
-  }, [authUser?.role]);
-
-  const handleLoginSuccess = (token: string, user: AuthUser) => {
-    setAuthToken(token);
-    setAuthUser(user);
-    if (user.assignedDeviceId && allDevices.some((d) => d.id === user.assignedDeviceId)) {
-      setSelectedDeviceId(user.assignedDeviceId);
-    }
-    setActiveTab(user.role === 'admin' ? 'admin' : 'sensitivity');
+    sensitivityLogTimerRef.current = window.setTimeout(() => {
+      recordAction(
+        'update_sensitivity',
+        `Adjusted ${key} to ${value} on ${selectedDevice.brand} ${selectedDevice.model}`
+      );
+    }, 2000);
   };
 
-  const handleLogout = async () => {
-    try {
-      await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
-    } catch {
-      // Ignore network errors on logout
-    }
-    setAuthToken(null);
-    setAuthUser(null);
-    setPendingRequestCount(0);
-    setActiveTab('sensitivity');
-    setMobileMenuOpen(false);
-  };
-
-  // Poll pending Mail ID request count so Admin sees incoming requests across any tab
-  useEffect(() => {
-    if (!authToken || authUser?.role !== 'admin') {
-      setPendingRequestCount(0);
-      return;
-    }
-    let cancelled = false;
-    const syncPending = async () => {
-      try {
-        const res = await fetch('/api/admin/requests', {
-          headers: { Authorization: `Bearer ${authToken}` },
-          cache: 'no-store',
-        });
-        if (!res.ok || cancelled) return;
-        const data = (await res.json()) as { requests?: { status?: string }[] };
-        if (!cancelled && Array.isArray(data.requests)) {
-          setPendingRequestCount(
-            data.requests.filter((r) => r.status === 'pending').length
-          );
-        }
-      } catch {
-        // Ignore transient network errors
-      }
-    };
-    syncPending();
-    const timer = window.setInterval(syncPending, 8000);
-    const onFocus = () => syncPending();
-    window.addEventListener('focus', onFocus);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-      window.removeEventListener('focus', onFocus);
-    };
-  }, [authToken, authUser?.role, activeTab]);
-
-  const activeNavLabel =
-    navItems.find((n) => n.id === activeTab)?.label ?? 'Sensitivity & DPI';
+  const activeNavLabel = isAdminRoute
+    ? 'Admin Console (/admin)'
+    : BASE_NAV_ITEMS.find((n) => n.id === activeTab)?.label ?? 'Sensitivity & DPI';
 
   const activePlaystyleName =
     PLAYSTYLE_META.find((p) => p.id === playstyle)?.name ?? 'One-Tap Precision';
@@ -461,6 +593,10 @@ export default function App() {
 
     setAutoCopied(copiedOk);
     setLaunchModalOpen(true);
+    recordAction(
+      'apply_launch',
+      `Applied & launched ${selectedDevice.brand} ${selectedDevice.model} (General ${sensitivityOverrides.general}, DPI ${calibration.dpiValue})`
+    );
   };
 
   if (authChecking) {
@@ -470,26 +606,74 @@ export default function App() {
           <h1 className="flex justify-center">
             <BrandLogo size="lg" centered />
           </h1>
-          <p className="mt-2 text-xs text-slate-400">Loading workspace...</p>
+          <p className="mt-2 text-xs text-slate-400">Connecting to Firebase...</p>
         </div>
       </div>
     );
   }
 
-  if (!authUser || !authToken) {
-    return <LoginView devices={allDevices} onLoginSuccess={handleLoginSuccess} />;
+  if (!firebaseUser) {
+    return (
+      <LoginView
+        devices={allDevices}
+        isAdminRoute={isAdminRoute}
+        onNavigateHome={() => navigateTo('/')}
+        onAuthComplete={handleAuthComplete}
+      />
+    );
+  }
+
+  const effectiveProfile: FirebaseUserProfile = userProfile ?? {
+    uid: firebaseUser.uid,
+    email: firebaseUser.email || '',
+    displayName: firebaseUser.displayName || 'Player',
+    photoURL: firebaseUser.photoURL || '',
+    status: isVerifiedAdmin ? 'approved' : 'pending',
+    role: isVerifiedAdmin ? 'admin' : 'user',
+    requestedDeviceId: selectedDeviceId,
+    createdAt: null,
+    lastLoginAt: null,
+    updatedAt: null,
+  };
+
+  // Strict /admin route guard: accessible ONLY to pucuz999@gmail.com
+  if (isAdminRoute && !isVerifiedAdmin) {
+    return (
+      <ApprovalStatusView
+        profile={effectiveProfile}
+        refreshing={refreshingStatus}
+        onRefresh={handleRefreshProfile}
+        onSignOut={handleLogout}
+        onGoHome={effectiveProfile.status === 'approved' ? () => navigateTo('/') : undefined}
+        titleOverride="Access Denied"
+        descriptionOverride={`The /admin dashboard is restricted exclusively to ${ADMIN_EMAIL}. You are currently signed in as ${effectiveProfile.email}.`}
+      />
+    );
+  }
+
+  // Gate main app: ONLY users with status 'approved' (or verified admin pucuz999@gmail.com) may enter
+  if (!isAdminRoute && !isVerifiedAdmin && effectiveProfile.status !== 'approved') {
+    return (
+      <ApprovalStatusView
+        profile={effectiveProfile}
+        refreshing={refreshingStatus}
+        onRefresh={handleRefreshProfile}
+        onSignOut={handleLogout}
+      />
+    );
   }
 
   return (
     <div className="min-h-screen bg-[#0B0E14] text-slate-100 flex">
-      {/* Desktop Sidebar (260px) */}
+      {/* Desktop Sidebar */}
       <aside className="hidden lg:flex lg:w-64 lg:flex-col lg:fixed lg:inset-y-0 border-r border-slate-800/90 bg-[#0E121B]">
         <div className="flex h-16 items-center px-6 border-b border-slate-800/80">
           <a
-            href="#top"
+            href="/"
             onClick={(e) => {
               e.preventDefault();
               setActiveTab('sensitivity');
+              navigateTo('/');
             }}
             className="inline-flex items-center whitespace-nowrap shrink-0"
           >
@@ -498,14 +682,18 @@ export default function App() {
         </div>
 
         <nav className="flex-1 px-3 py-5 space-y-1" aria-label="Primary Workspace">
-          {navItems.map((item) => {
+          {BASE_NAV_ITEMS.map((item) => {
             const Icon = item.icon;
-            const isActive = activeTab === item.id;
+            const isActive = !isAdminRoute && activeTab === item.id;
             return (
               <button
                 key={item.id}
                 type="button"
-                onClick={() => setActiveTab(item.id)}
+                onClick={() => {
+                  setActiveTab(item.id);
+                  navigateTo('/');
+                  recordAction('view_tab', `Opened ${item.label}`);
+                }}
                 className={`flex w-full items-center justify-between gap-3 rounded-lg px-3.5 py-2.5 text-sm font-medium transition-colors whitespace-nowrap ${
                   isActive
                     ? 'bg-orange-500/12 text-orange-400'
@@ -521,22 +709,40 @@ export default function App() {
                     {savedProfiles.length}
                   </span>
                 )}
-                {item.id === 'admin' && pendingRequestCount > 0 && (
-                  <span className="rounded-md bg-orange-500 px-1.5 py-0.5 font-mono text-[11px] font-bold text-slate-950">
-                    {pendingRequestCount}
-                  </span>
-                )}
               </button>
             );
           })}
+
+          {isVerifiedAdmin && (
+            <a
+              href="/admin"
+              onClick={(e) => {
+                e.preventDefault();
+                navigateTo('/admin');
+              }}
+              className={`flex w-full items-center justify-between gap-3 rounded-lg px-3.5 py-2.5 text-sm font-medium transition-colors whitespace-nowrap ${
+                isAdminRoute
+                  ? 'bg-orange-500/12 text-orange-400'
+                  : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-100'
+              }`}
+            >
+              <span className="flex items-center gap-3 min-w-0">
+                <ShieldCheck className="h-4 w-4 shrink-0" />
+                <span className="truncate">Admin (/admin)</span>
+              </span>
+              {pendingUsersCount > 0 && (
+                <span className="rounded-md bg-orange-500 px-1.5 py-0.5 font-mono text-[11px] font-bold text-slate-950">
+                  {pendingUsersCount}
+                </span>
+              )}
+            </a>
+          )}
         </nav>
 
         {/* Active Hardware & Account Footer */}
         <div className="border-t border-slate-800/80 p-4 space-y-3">
           <div>
-            <p className="text-[11px] font-medium text-slate-400">
-              Selected Hardware
-            </p>
+            <p className="text-[11px] font-medium text-slate-400">Selected Hardware</p>
             <p className="mt-1 truncate text-sm font-semibold text-white">
               {selectedDevice.brand} {selectedDevice.model}
             </p>
@@ -547,11 +753,11 @@ export default function App() {
 
           <div className="flex items-center justify-between gap-2 border-t border-slate-800/80 pt-3">
             <div className="min-w-0">
-              <p className="truncate font-mono text-xs font-semibold text-white">
-                {authUser.customId}
+              <p className="truncate text-xs font-semibold text-white">
+                {effectiveProfile.displayName}
               </p>
-              <p className="text-[11px] text-slate-400">
-                {authUser.role === 'admin' ? 'Administrator' : 'Customer'}
+              <p className="truncate font-mono text-[11px] text-slate-400">
+                {effectiveProfile.email}
               </p>
             </div>
             <button
@@ -586,16 +792,18 @@ export default function App() {
               </button>
             </div>
             <nav className="flex-1 px-3 py-4 space-y-1">
-              {navItems.map((item) => {
+              {BASE_NAV_ITEMS.map((item) => {
                 const Icon = item.icon;
-                const isActive = activeTab === item.id;
+                const isActive = !isAdminRoute && activeTab === item.id;
                 return (
                   <button
                     key={item.id}
                     type="button"
                     onClick={() => {
                       setActiveTab(item.id);
+                      navigateTo('/');
                       setMobileMenuOpen(false);
+                      recordAction('view_tab', `Opened ${item.label}`);
                     }}
                     className={`flex w-full items-center justify-between gap-3 rounded-lg px-3.5 py-3 text-sm font-medium transition-colors ${
                       isActive
@@ -612,22 +820,43 @@ export default function App() {
                         {savedProfiles.length}
                       </span>
                     )}
-                    {item.id === 'admin' && pendingRequestCount > 0 && (
-                      <span className="rounded-md bg-orange-500 px-1.5 py-0.5 font-mono text-[11px] font-bold text-slate-950">
-                        {pendingRequestCount}
-                      </span>
-                    )}
                   </button>
                 );
               })}
+
+              {isVerifiedAdmin && (
+                <a
+                  href="/admin"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    navigateTo('/admin');
+                    setMobileMenuOpen(false);
+                  }}
+                  className={`flex w-full items-center justify-between gap-3 rounded-lg px-3.5 py-3 text-sm font-medium transition-colors ${
+                    isAdminRoute
+                      ? 'bg-orange-500/12 text-orange-400'
+                      : 'text-slate-400 hover:bg-slate-800/50 hover:text-white'
+                  }`}
+                >
+                  <span className="flex items-center gap-3">
+                    <ShieldCheck className="h-4 w-4 shrink-0" />
+                    <span>Admin (/admin)</span>
+                  </span>
+                  {pendingUsersCount > 0 && (
+                    <span className="rounded-md bg-orange-500 px-1.5 py-0.5 font-mono text-[11px] font-bold text-slate-950">
+                      {pendingUsersCount}
+                    </span>
+                  )}
+                </a>
+              )}
             </nav>
             <div className="border-t border-slate-800 p-4 flex items-center justify-between gap-2">
               <div className="min-w-0">
-                <p className="truncate font-mono text-xs font-semibold text-white">
-                  {authUser.customId}
+                <p className="truncate text-xs font-semibold text-white">
+                  {effectiveProfile.displayName}
                 </p>
-                <p className="text-[11px] text-slate-400">
-                  {authUser.role === 'admin' ? 'Administrator' : 'Customer'}
+                <p className="truncate font-mono text-[11px] text-slate-400">
+                  {effectiveProfile.email}
                 </p>
               </div>
               <button
@@ -645,7 +874,6 @@ export default function App() {
 
       {/* Main Content Area */}
       <div className="flex-1 lg:pl-64 flex flex-col min-w-0">
-        {/* Top Bar Contract: Breadcrumb Left · Single Primary Action Right */}
         <header className="sticky top-0 z-30 flex h-16 items-center justify-between gap-6 border-b border-slate-800/80 bg-[#0B0E14]/90 px-4 sm:px-8 backdrop-blur-md">
           <div className="flex items-center gap-3 min-w-0">
             <button
@@ -661,13 +889,15 @@ export default function App() {
                 Workspace
               </span>
               <span className="text-slate-600 hidden sm:inline">/</span>
-              <span className="font-semibold text-white truncate">
-                {activeNavLabel}
-              </span>
-              <span className="text-slate-600 hidden md:inline">·</span>
-              <span className="text-xs text-slate-400 hidden md:inline truncate">
-                {selectedDevice.brand} {selectedDevice.model}
-              </span>
+              <span className="font-semibold text-white truncate">{activeNavLabel}</span>
+              {!isAdminRoute && (
+                <>
+                  <span className="text-slate-600 hidden md:inline">·</span>
+                  <span className="text-xs text-slate-400 hidden md:inline truncate">
+                    {selectedDevice.brand} {selectedDevice.model}
+                  </span>
+                </>
+              )}
             </div>
           </div>
 
@@ -684,89 +914,86 @@ export default function App() {
           </div>
         </header>
 
-        {/* Main Workspace Viewport */}
         <main className="mx-auto w-full max-w-[1240px] flex-1 px-4 py-6 sm:px-8 sm:py-8">
-          {activeTab === 'sensitivity' && (
-            <DeviceSensitivityView
-              devices={allDevices}
-              selectedDevice={selectedDevice}
-              onSelectDevice={(d) => setSelectedDeviceId(d.id)}
-              onOpenCustomModal={() => setCustomModalOpen(true)}
-              playstyle={playstyle}
-              onChangePlaystyle={setPlaystyle}
-              grip={grip}
-              onChangeGrip={setGrip}
-              rangeBias={rangeBias}
-              onChangeRangeBias={setRangeBias}
-              calibration={calibration}
-              sensitivityOverrides={sensitivityOverrides}
-              fireButtonOverride={fireButtonOverride}
-              onUpdateSensitivity={(key, value) =>
-                setSensitivityOverrides((prev) => ({ ...prev, [key]: value }))
-              }
-              onUpdateFireButton={setFireButtonOverride}
-              onResetOverrides={() => {
-                setSensitivityOverrides(calibration.sensitivity);
-                setFireButtonOverride(calibration.fireButtonSize);
-              }}
-              onSaveProfile={handleSaveProfile}
-            />
-          )}
-
-          {activeTab === 'performance' && (
-            <PerformanceBoosterView
-              device={selectedDevice}
-              calibration={calibration}
-              completedStepIds={checklistMap[selectedDevice.id] ?? []}
-              onToggleStep={handleToggleChecklistStep}
-              onResetSteps={handleResetChecklist}
-              notificationBlock={notificationBlock}
-              onUpdateNotificationBlock={setNotificationBlock}
-            />
-          )}
-
-          {activeTab === 'drag-lab' && (
-            <DragHeadshotLab
-              sensitivity={sensitivityOverrides}
-              fireButtonSize={fireButtonOverride}
-            />
-          )}
-
-          {activeTab === 'saved' && (
-            <SavedProfilesView
-              profiles={savedProfiles}
-              onLoadProfile={handleLoadProfile}
-              onDeleteProfile={(id) =>
-                setSavedProfiles((prev) => prev.filter((p) => p.id !== id))
-              }
-              onImportProfiles={(incoming) =>
-                setSavedProfiles((prev) => {
-                  const existingIds = new Set(prev.map((p) => p.id));
-                  const fresh = incoming.filter(
-                    (p) => p && typeof p.id === 'string' && !existingIds.has(p.id)
-                  );
-                  return [...fresh, ...prev];
-                })
-              }
-            />
-          )}
-
-          {activeTab === 'admin' && authUser.role === 'admin' && (
+          {isAdminRoute && isVerifiedAdmin ? (
             <AdminPanelView
-              token={authToken}
-              currentAdminId={authUser.customId}
-              currentUserId={authUser.id}
+              currentUser={firebaseUser}
               devices={allDevices}
               masterDevices={masterDevices}
               catalogOverrides={catalogOverrides}
-              onCatalogOverridesChange={setCatalogOverrides}
-              onAdminCredentialsUpdated={(nextToken, nextUser) => {
-                setAuthToken(nextToken);
-                setAuthUser(nextUser);
-              }}
-              onResetAdminClaim={handleLogout}
-              onPendingCountChange={setPendingRequestCount}
+              onPendingCountChange={setPendingUsersCount}
             />
+          ) : (
+            <>
+              {activeTab === 'sensitivity' && (
+                <DeviceSensitivityView
+                  devices={allDevices}
+                  selectedDevice={selectedDevice}
+                  onSelectDevice={handleSelectDevice}
+                  onOpenCustomModal={() => setCustomModalOpen(true)}
+                  playstyle={playstyle}
+                  onChangePlaystyle={setPlaystyle}
+                  grip={grip}
+                  onChangeGrip={setGrip}
+                  rangeBias={rangeBias}
+                  onChangeRangeBias={setRangeBias}
+                  calibration={calibration}
+                  sensitivityOverrides={sensitivityOverrides}
+                  fireButtonOverride={fireButtonOverride}
+                  onUpdateSensitivity={handleSensitivityChange}
+                  onUpdateFireButton={setFireButtonOverride}
+                  onResetOverrides={() => {
+                    setSensitivityOverrides(calibration.sensitivity);
+                    setFireButtonOverride(calibration.fireButtonSize);
+                    recordAction(
+                      'update_sensitivity',
+                      `Reset sensitivity overrides for ${selectedDevice.brand} ${selectedDevice.model}`
+                    );
+                  }}
+                  onSaveProfile={handleSaveProfile}
+                />
+              )}
+
+              {activeTab === 'performance' && (
+                <PerformanceBoosterView
+                  device={selectedDevice}
+                  calibration={calibration}
+                  completedStepIds={checklistMap[selectedDevice.id] ?? []}
+                  onToggleStep={handleToggleChecklistStep}
+                  onResetSteps={handleResetChecklist}
+                  notificationBlock={notificationBlock}
+                  onUpdateNotificationBlock={setNotificationBlock}
+                />
+              )}
+
+              {activeTab === 'drag-lab' && (
+                <DragHeadshotLab
+                  sensitivity={sensitivityOverrides}
+                  fireButtonSize={fireButtonOverride}
+                />
+              )}
+
+              {activeTab === 'saved' && (
+                <SavedProfilesView
+                  profiles={savedProfiles}
+                  onLoadProfile={handleLoadProfile}
+                  onDeleteProfile={(id) => {
+                    setSavedProfiles((prev) => prev.filter((p) => p.id !== id));
+                    recordAction('delete_preset', `Deleted preset ${id}`);
+                  }}
+                  onImportProfiles={(incoming) => {
+                    setSavedProfiles((prev) => {
+                      const existingIds = new Set(prev.map((p) => p.id));
+                      const fresh = incoming.filter(
+                        (p) => p && typeof p.id === 'string' && !existingIds.has(p.id)
+                      );
+                      return [...fresh, ...prev];
+                    });
+                    recordAction('save_preset', `Imported ${incoming.length} preset(s)`);
+                  }}
+                />
+              )}
+            </>
           )}
         </main>
       </div>

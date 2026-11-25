@@ -1,0 +1,296 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Core Identity & Validation Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isAdmin() {
+      return isVerified() && request.auth.token.email == 'pucuz999@gmail.com';
+    }
+
+    function isOwner(userId) {
+      return isVerified() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll([
+        'uid',
+        'email',
+        'displayName',
+        'photoURL',
+        'status',
+        'role',
+        'requestedDeviceId',
+        'createdAt',
+        'lastLoginAt',
+        'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'uid',
+        'email',
+        'displayName',
+        'photoURL',
+        'status',
+        'role',
+        'requestedDeviceId',
+        'createdAt',
+        'lastLoginAt',
+        'updatedAt'
+      ])
+      && isValidId(data.uid)
+      && data.email is string && data.email.size() >= 3 && data.email.size() <= 200
+      && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100
+      && data.photoURL is string && data.photoURL.size() <= 500
+      && data.status in ['pending', 'approved', 'blocked']
+      && data.role in ['user', 'admin']
+      && data.requestedDeviceId is string && data.requestedDeviceId.size() >= 1 && data.requestedDeviceId.size() <= 64
+      && data.createdAt is timestamp
+      && data.lastLoginAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidActivityLog(data) {
+      return data.keys().hasAll([
+        'userId',
+        'userEmail',
+        'userDisplayName',
+        'action',
+        'details',
+        'createdAt'
+      ])
+      && data.keys().hasOnly([
+        'userId',
+        'userEmail',
+        'userDisplayName',
+        'action',
+        'details',
+        'createdAt'
+      ])
+      && isValidId(data.userId)
+      && data.userEmail is string && data.userEmail.size() >= 3 && data.userEmail.size() <= 200
+      && data.userDisplayName is string && data.userDisplayName.size() >= 1 && data.userDisplayName.size() <= 100
+      && data.action in [
+        'signup',
+        'login',
+        'logout',
+        'view_tab',
+        'select_device',
+        'update_sensitivity',
+        'save_preset',
+        'delete_preset',
+        'apply_launch',
+        'toggle_optimization',
+        'practice_drag',
+        'admin_approve_user',
+        'admin_block_user'
+      ]
+      && data.details is string && data.details.size() <= 300
+      && data.createdAt is timestamp;
+    }
+
+    function isValidCatalogDevice(data) {
+      return data.keys().hasAll([
+        'id',
+        'brand',
+        'model',
+        'tier',
+        'os',
+        'ramGb',
+        'refreshHz',
+        'touchSamplingHz',
+        'ppi',
+        'screenInches',
+        'chipset',
+        'defaultDpi',
+        'recommendedDpi',
+        'thermalHeadroom',
+        'removed',
+        'updatedBy',
+        'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'id',
+        'brand',
+        'model',
+        'tier',
+        'os',
+        'ramGb',
+        'refreshHz',
+        'touchSamplingHz',
+        'ppi',
+        'screenInches',
+        'chipset',
+        'defaultDpi',
+        'recommendedDpi',
+        'thermalHeadroom',
+        'presetSensitivity',
+        'presetFireButton',
+        'removed',
+        'updatedBy',
+        'updatedAt'
+      ])
+      && isValidId(data.id)
+      && data.brand is string && data.brand.size() >= 1 && data.brand.size() <= 40
+      && data.model is string && data.model.size() >= 1 && data.model.size() <= 80
+      && data.tier in ['low', 'mid', 'high', 'gaming', 'ios']
+      && data.os in ['Android', 'iOS']
+      && data.ramGb is number && data.ramGb >= 1 && data.ramGb <= 32
+      && data.refreshHz is number && data.refreshHz >= 30 && data.refreshHz <= 240
+      && data.touchSamplingHz is number && data.touchSamplingHz >= 60 && data.touchSamplingHz <= 1000
+      && data.ppi is number && data.ppi >= 120 && data.ppi <= 700
+      && data.screenInches is number && data.screenInches >= 4 && data.screenInches <= 15
+      && data.chipset is string && data.chipset.size() >= 1 && data.chipset.size() <= 80
+      && data.defaultDpi is number && data.defaultDpi >= 100 && data.defaultDpi <= 600
+      && data.recommendedDpi is number && data.recommendedDpi >= 100 && data.recommendedDpi <= 650
+      && data.thermalHeadroom in ['Tight', 'Moderate', 'High']
+      && data.removed is bool
+      && isValidId(data.updatedBy)
+      && data.updatedAt is timestamp
+      && (!('presetFireButton' in data) || (data.presetFireButton is number && data.presetFireButton >= 32 && data.presetFireButton <= 70))
+      && (!('presetSensitivity' in data) || (
+        data.presetSensitivity is map
+        && data.presetSensitivity.keys().hasAll(['general', 'redDot', 'scope2x', 'scope4x', 'sniperScope', 'freeLook'])
+        && data.presetSensitivity.keys().hasOnly(['general', 'redDot', 'scope2x', 'scope4x', 'sniperScope', 'freeLook'])
+      ));
+    }
+
+    // Users collection: PII isolated to owner or verified admin
+    match /users/{userId} {
+      allow get: if isVerified() && isValidId(userId) && (isAdmin() || isOwner(userId));
+      allow list: if isVerified() && (isAdmin() || resource.data.uid == request.auth.uid);
+
+      allow create: if isVerified()
+        && isValidId(userId)
+        && isValidUserProfile(incoming())
+        && incoming().uid == userId
+        && incoming().uid == request.auth.uid
+        && incoming().email == request.auth.token.email
+        && incoming().createdAt == request.time
+        && incoming().lastLoginAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          (isAdmin() && incoming().role == 'admin' && incoming().status == 'approved') ||
+          (!isAdmin() && incoming().role == 'user' && incoming().status == 'pending')
+        );
+
+      allow update: if isVerified()
+        && isValidId(userId)
+        && isValidUserProfile(incoming())
+        && incoming().uid == existing().uid
+        && incoming().email == existing().email
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (
+            isAdmin()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status',
+              'role',
+              'updatedAt',
+              'lastLoginAt',
+              'displayName',
+              'photoURL',
+              'requestedDeviceId'
+            ])
+          ) || (
+            isOwner(userId)
+            && incoming().status == existing().status
+            && incoming().role == existing().role
+            && (incoming().lastLoginAt == existing().lastLoginAt || incoming().lastLoginAt == request.time)
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'lastLoginAt',
+              'updatedAt',
+              'displayName',
+              'photoURL',
+              'requestedDeviceId'
+            ])
+          )
+        );
+
+      allow delete: if isAdmin() && isValidId(userId);
+    }
+
+    // Append-only User & Admin Activity Logs
+    match /activityLogs/{logId} {
+      allow get: if isVerified() && isValidId(logId) && (isAdmin() || existing().userId == request.auth.uid);
+      allow list: if isVerified() && (isAdmin() || resource.data.userId == request.auth.uid);
+
+      allow create: if isVerified()
+        && isValidId(logId)
+        && isValidActivityLog(incoming())
+        && incoming().userId == request.auth.uid
+        && incoming().userEmail == request.auth.token.email
+        && incoming().createdAt == request.time
+        && (isAdmin() || (incoming().action != 'admin_approve_user' && incoming().action != 'admin_block_user'))
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+
+      allow update, delete: if false;
+    }
+
+    // Master Device Sensitivity Catalog Overrides (non-PII hardware specs)
+    match /catalogDevices/{deviceId} {
+      allow get: if isVerified() && isValidId(deviceId);
+      allow list: if isVerified();
+
+      allow create: if isAdmin()
+        && isValidId(deviceId)
+        && isValidCatalogDevice(incoming())
+        && incoming().id == deviceId
+        && incoming().updatedBy == request.auth.uid
+        && incoming().updatedAt == request.time;
+
+      allow update: if isAdmin()
+        && isValidId(deviceId)
+        && isValidCatalogDevice(incoming())
+        && incoming().id == existing().id
+        && incoming().updatedBy == request.auth.uid
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'brand',
+          'model',
+          'tier',
+          'os',
+          'ramGb',
+          'refreshHz',
+          'touchSamplingHz',
+          'ppi',
+          'screenInches',
+          'chipset',
+          'defaultDpi',
+          'recommendedDpi',
+          'thermalHeadroom',
+          'presetSensitivity',
+          'presetFireButton',
+          'removed',
+          'updatedBy',
+          'updatedAt'
+        ]);
+
+      allow delete: if isAdmin() && isValidId(deviceId);
+    }
+  }
+}

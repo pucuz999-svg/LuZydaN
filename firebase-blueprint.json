@@ -1,0 +1,250 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated Firebase user profile with admin approval status and last login timestamp.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID matching the document ID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified email address from Firebase Authentication.",
+          "minLength": 3,
+          "maxLength": 200
+        },
+        "displayName": {
+          "type": "string",
+          "description": "User display name.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "Profile avatar URL or empty string.",
+          "maxLength": 500
+        },
+        "status": {
+          "type": "string",
+          "description": "Access approval status managed by the administrator.",
+          "enum": ["pending", "approved", "blocked"]
+        },
+        "role": {
+          "type": "string",
+          "description": "Application role assigned by server/rules.",
+          "enum": ["user", "admin"]
+        },
+        "requestedDeviceId": {
+          "type": "string",
+          "description": "Preferred device catalog ID selected by the user.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Firestore server timestamp when the user first signed up."
+        },
+        "lastLoginAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Firestore server timestamp of the user's most recent sign-in."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Firestore server timestamp of the latest profile update."
+        }
+      },
+      "required": [
+        "uid",
+        "email",
+        "displayName",
+        "photoURL",
+        "status",
+        "role",
+        "requestedDeviceId",
+        "createdAt",
+        "lastLoginAt",
+        "updatedAt"
+      ]
+    },
+    "ActivityLog": {
+      "title": "ActivityLog",
+      "description": "Append-only audit trail of actions performed by authenticated users.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "UID of the user who performed the action.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userEmail": {
+          "type": "string",
+          "format": "email",
+          "description": "Email of the user who performed the action.",
+          "minLength": 3,
+          "maxLength": 200
+        },
+        "userDisplayName": {
+          "type": "string",
+          "description": "Display name at the time of the action.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "action": {
+          "type": "string",
+          "description": "Categorized action identifier.",
+          "enum": [
+            "signup",
+            "login",
+            "logout",
+            "view_tab",
+            "select_device",
+            "update_sensitivity",
+            "save_preset",
+            "delete_preset",
+            "apply_launch",
+            "toggle_optimization",
+            "practice_drag",
+            "admin_approve_user",
+            "admin_block_user"
+          ]
+        },
+        "details": {
+          "type": "string",
+          "description": "Human-readable description of the action taken.",
+          "maxLength": 300
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Firestore server timestamp when the action occurred."
+        }
+      },
+      "required": [
+        "userId",
+        "userEmail",
+        "userDisplayName",
+        "action",
+        "details",
+        "createdAt"
+      ]
+    },
+    "CatalogDevice": {
+      "title": "CatalogDevice",
+      "description": "Admin-managed device sensitivity override or removal marker in the master catalog.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "brand": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "tier": {
+          "type": "string",
+          "enum": ["low", "mid", "high", "gaming", "ios"]
+        },
+        "os": {
+          "type": "string",
+          "enum": ["Android", "iOS"]
+        },
+        "ramGb": {
+          "type": "number"
+        },
+        "refreshHz": {
+          "type": "number"
+        },
+        "touchSamplingHz": {
+          "type": "number"
+        },
+        "ppi": {
+          "type": "number"
+        },
+        "screenInches": {
+          "type": "number"
+        },
+        "chipset": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "defaultDpi": {
+          "type": "number"
+        },
+        "recommendedDpi": {
+          "type": "number"
+        },
+        "thermalHeadroom": {
+          "type": "string",
+          "enum": ["Tight", "Moderate", "High"]
+        },
+        "removed": {
+          "type": "boolean"
+        },
+        "updatedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "brand",
+        "model",
+        "tier",
+        "os",
+        "ramGb",
+        "refreshHz",
+        "touchSamplingHz",
+        "ppi",
+        "screenInches",
+        "chipset",
+        "defaultDpi",
+        "recommendedDpi",
+        "thermalHeadroom",
+        "removed",
+        "updatedBy",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Stores user profile, pending/approved/blocked status, role, and last login timestamp."
+    },
+    "/activityLogs/{logId}": {
+      "schema": { "$ref": "#/entities/ActivityLog" },
+      "description": "Stores append-only user and admin action history for the /admin dashboard."
+    },
+    "/catalogDevices/{deviceId}": {
+      "schema": { "$ref": "#/entities/CatalogDevice" },
+      "description": "Stores admin-managed device sensitivity overrides and removals."
+    }
+  }
+}
