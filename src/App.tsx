@@ -19,9 +19,10 @@ import { LoginView } from './components/LoginView';
 import { PerformanceBoosterView } from './components/PerformanceBoosterView';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { SavedProfilesView } from './components/SavedProfilesView';
-import { DEVICE_CATALOG, PLAYSTYLE_META } from './utils/devices';
+import { DEVICE_CATALOG, PLAYSTYLE_META, mergeMasterCatalog } from './utils/devices';
 import {
   AuthUser,
+  CatalogOverrides,
   DeviceSpec,
   GripType,
   NotificationBlockSettings,
@@ -123,20 +124,30 @@ export default function App() {
     }
   });
 
+  const [catalogOverrides, setCatalogOverrides] = useState<CatalogOverrides>({
+    upsertedDevices: [],
+    removedIds: [],
+  });
+
+  const masterDevices = useMemo(
+    () => mergeMasterCatalog(DEVICE_CATALOG, catalogOverrides),
+    [catalogOverrides]
+  );
+
   const allDevices = useMemo(
-    () => [...customDevices, ...DEVICE_CATALOG],
-    [customDevices]
+    () => [...customDevices, ...masterDevices],
+    [customDevices, masterDevices]
   );
 
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>(
-    () => allDevices.find((d) => d.id === 'redmi-note-12')?.id ?? allDevices[0].id
+    () => allDevices.find((d) => d.id === 'samsung-a54')?.id ?? allDevices.find((d) => d.id === 'redmi-note-12')?.id ?? allDevices[0]?.id ?? DEVICE_CATALOG[0].id
   );
   const [playstyle, setPlaystyle] = useState<PlaystyleId>('one-tap');
   const [grip, setGrip] = useState<GripType>('2-finger');
   const [rangeBias, setRangeBias] = useState<RangeBias>('mid');
 
   const selectedDevice = useMemo(
-    () => allDevices.find((d) => d.id === selectedDeviceId) ?? allDevices[0],
+    () => allDevices.find((d) => d.id === selectedDeviceId) ?? allDevices[0] ?? DEVICE_CATALOG[0],
     [allDevices, selectedDeviceId]
   );
 
@@ -164,15 +175,35 @@ export default function App() {
     setFireButtonOverride(calibration.fireButtonSize);
   }, [calibration]);
 
-  // Restore session from HttpOnly cookie on page reload or PWA relaunch
+  // Restore session and load admin master catalog overrides on page reload or PWA relaunch
   useEffect(() => {
     let active = true;
-    const restoreSession = async () => {
+    const bootstrapWorkspace = async () => {
       try {
-        const res = await fetch('/api/auth/session', { credentials: 'same-origin' });
-        const contentType = res.headers.get('content-type') || '';
-        if (res.ok && contentType.includes('application/json') && active) {
-          const data = (await res.json()) as {
+        const [sessionRes, catalogRes] = await Promise.all([
+          fetch('/api/auth/session', { credentials: 'same-origin' }),
+          fetch('/api/catalog/overrides'),
+        ]);
+
+        let latestMaster = DEVICE_CATALOG;
+        const catalogType = catalogRes.headers.get('content-type') || '';
+        if (catalogRes.ok && catalogType.includes('application/json') && active) {
+          const catalogData = (await catalogRes.json()) as Partial<CatalogOverrides>;
+          const normalized: CatalogOverrides = {
+            upsertedDevices: Array.isArray(catalogData.upsertedDevices)
+              ? catalogData.upsertedDevices
+              : [],
+            removedIds: Array.isArray(catalogData.removedIds)
+              ? catalogData.removedIds
+              : [],
+          };
+          setCatalogOverrides(normalized);
+          latestMaster = mergeMasterCatalog(DEVICE_CATALOG, normalized);
+        }
+
+        const contentType = sessionRes.headers.get('content-type') || '';
+        if (sessionRes.ok && contentType.includes('application/json') && active) {
+          const data = (await sessionRes.json()) as {
             authenticated?: boolean;
             token?: string | null;
             user?: AuthUser | null;
@@ -180,9 +211,10 @@ export default function App() {
           if (data.authenticated && data.token && data.user) {
             setAuthToken(data.token);
             setAuthUser(data.user);
+            const mergedAvailable = [...customDevices, ...latestMaster];
             if (
               data.user.assignedDeviceId &&
-              allDevices.some((d) => d.id === data.user?.assignedDeviceId)
+              mergedAvailable.some((d) => d.id === data.user?.assignedDeviceId)
             ) {
               setSelectedDeviceId(data.user.assignedDeviceId);
             }
@@ -195,7 +227,7 @@ export default function App() {
         if (active) setAuthChecking(false);
       }
     };
-    restoreSession();
+    bootstrapWorkspace();
     return () => {
       active = false;
     };
@@ -679,6 +711,9 @@ export default function App() {
               currentAdminId={authUser.customId}
               currentUserId={authUser.id}
               devices={allDevices}
+              masterDevices={masterDevices}
+              catalogOverrides={catalogOverrides}
+              onCatalogOverridesChange={setCatalogOverrides}
               onAdminCredentialsUpdated={(nextToken, nextUser) => {
                 setAuthToken(nextToken);
                 setAuthUser(nextUser);

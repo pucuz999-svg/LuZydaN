@@ -32,11 +32,14 @@ interface DeviceSensitivityViewProps {
   onSaveProfile: (name: string) => void;
 }
 
-type DeviceFilter = 'all' | 'motorola' | DeviceTier;
+type DeviceFilter = 'all' | 'samsung' | 'xiaomi' | 'motorola' | 'vivo' | DeviceTier;
 
 const TIER_FILTERS: { id: DeviceFilter; label: string }[] = [
   { id: 'all', label: 'All Devices' },
+  { id: 'samsung', label: 'Samsung' },
+  { id: 'xiaomi', label: 'Xiaomi / Mi' },
   { id: 'motorola', label: 'Motorola' },
+  { id: 'vivo', label: 'Vivo' },
   { id: 'low', label: '2-3GB Budget' },
   { id: 'mid', label: '4-6GB Mid' },
   { id: 'high', label: 'Flagship' },
@@ -133,8 +136,18 @@ export const DeviceSensitivityView: React.FC<DeviceSensitivityViewProps> = ({
   const filteredDevices = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return devices.filter((d) => {
+      if (tierFilter === 'samsung' && d.brand !== 'Samsung') return false;
+      if (tierFilter === 'xiaomi' && d.brand !== 'Xiaomi' && d.brand !== 'POCO') return false;
       if (tierFilter === 'motorola' && d.brand !== 'Motorola') return false;
-      if (tierFilter !== 'all' && tierFilter !== 'motorola' && d.tier !== tierFilter) {
+      if (tierFilter === 'vivo' && d.brand !== 'Vivo' && d.brand !== 'iQOO') return false;
+      if (
+        tierFilter !== 'all' &&
+        tierFilter !== 'samsung' &&
+        tierFilter !== 'xiaomi' &&
+        tierFilter !== 'motorola' &&
+        tierFilter !== 'vivo' &&
+        d.tier !== tierFilter
+      ) {
         return false;
       }
       if (!q) return true;

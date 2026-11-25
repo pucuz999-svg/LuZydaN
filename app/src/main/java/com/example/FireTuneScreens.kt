@@ -32,21 +32,29 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.AdminPanelSettings
 import androidx.compose.material.icons.rounded.Bookmark
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.Email
 import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.NotificationsOff
+import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.PhoneAndroid
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.RocketLaunch
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Send
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.TrackChanges
+import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -98,6 +106,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
@@ -154,7 +164,10 @@ fun SensitivityScreen(
       val tierOk =
         when (filterMode) {
           "all" -> true
+          "samsung" -> d.brand.equals("Samsung", ignoreCase = true)
+          "xiaomi" -> d.brand.equals("Xiaomi", ignoreCase = true) || d.brand.equals("POCO", ignoreCase = true)
           "motorola" -> d.brand.equals("Motorola", ignoreCase = true)
+          "vivo" -> d.brand.equals("Vivo", ignoreCase = true) || d.brand.equals("iQOO", ignoreCase = true)
           "low" -> d.tier == DeviceTier.LOW
           "mid" -> d.tier == DeviceTier.MID
           "high" -> d.tier == DeviceTier.HIGH
@@ -231,7 +244,10 @@ fun SensitivityScreen(
       ) {
         val filters = listOf(
           "all" to "All",
+          "samsung" to "Samsung",
+          "xiaomi" to "Xiaomi/Mi",
           "motorola" to "Motorola",
+          "vivo" to "Vivo",
           "low" to "2-3GB",
           "mid" to "4-6GB",
           "high" to "Flagship",
@@ -1893,6 +1909,785 @@ private fun TallyBadge(label: String, count: Int, color: Color) {
       fontFamily = FontFamily.Monospace,
       fontWeight = FontWeight.Bold,
       fontSize = 16.sp,
+    )
+  }
+}
+
+private enum class AuthTabMode(val label: String) {
+  USER("User Login"),
+  REQUEST("Request Login"),
+  ADMIN("Admin Login"),
+}
+
+@Composable
+fun AuthGateScreen(
+  devices: List<DeviceSpec>,
+  adminConfigured: Boolean,
+  onUserLogin: (identifier: String, password: String) -> String?,
+  onRequestLogin: (
+    email: String,
+    customId: String,
+    displayName: String,
+    password: String,
+    deviceId: String,
+    note: String,
+  ) -> Pair<String?, String?>,
+  onAdminClaim: (adminId: String, password: String) -> String?,
+  onAdminLogin: (adminId: String, password: String) -> String?,
+) {
+  var tab by remember { mutableStateOf(AuthTabMode.USER) }
+  var email by remember { mutableStateOf("") }
+  var customId by remember { mutableStateOf("") }
+  var displayName by remember { mutableStateOf("") }
+  var password by remember { mutableStateOf("") }
+  var confirmPassword by remember { mutableStateOf("") }
+  var selectedDeviceId by remember { mutableStateOf("samsung-a54") }
+  var note by remember { mutableStateOf("") }
+  var showPassword by remember { mutableStateOf(false) }
+  var showDevicePicker by remember { mutableStateOf(false) }
+  var errorMsg by remember { mutableStateOf<String?>(null) }
+  var statusMsg by remember { mutableStateOf<String?>(null) }
+
+  val isFirstRunAdminClaim = tab == AuthTabMode.ADMIN && !adminConfigured
+  val selectedDeviceObj = remember(devices, selectedDeviceId) {
+    devices.find { it.id == selectedDeviceId } ?: devices.first()
+  }
+
+  Column(
+    modifier = Modifier
+      .fillMaxSize()
+      .background(BgObsidian)
+      .verticalScroll(rememberScrollState())
+      .padding(horizontal = 20.dp, vertical = 28.dp),
+    horizontalAlignment = Alignment.CenterHorizontally,
+    verticalArrangement = Arrangement.Center,
+  ) {
+    Text(
+      text = "FireTune",
+      color = OrangeAccent,
+      fontSize = 30.sp,
+      fontWeight = FontWeight.Bold,
+    )
+    Spacer(Modifier.height(4.dp))
+    Text(
+      text = "Free Fire Sensitivity, DPI & Samsung Calibration Studio",
+      color = TextMuted,
+      fontSize = 12.sp,
+    )
+    Spacer(Modifier.height(20.dp))
+
+    PanelCard {
+      Row(
+        modifier = Modifier
+          .fillMaxWidth()
+          .clip(RoundedCornerShape(10.dp))
+          .background(BgObsidian)
+          .border(1.dp, BorderSlate, RoundedCornerShape(10.dp))
+          .padding(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+      ) {
+        AuthTabMode.entries.forEach { mode ->
+          val active = tab == mode
+          Surface(
+            modifier = Modifier
+              .weight(1f)
+              .clickable {
+                tab = mode
+                errorMsg = null
+                statusMsg = null
+                password = ""
+                confirmPassword = ""
+                if (mode == AuthTabMode.ADMIN) customId = ""
+              },
+            color = if (active) OrangeAccent else Color.Transparent,
+            shape = RoundedCornerShape(8.dp),
+          ) {
+            Row(
+              modifier = Modifier.padding(vertical = 10.dp, horizontal = 4.dp),
+              horizontalArrangement = Arrangement.Center,
+              verticalAlignment = Alignment.CenterVertically,
+            ) {
+              val icon = when (mode) {
+                AuthTabMode.USER -> Icons.Rounded.Person
+                AuthTabMode.REQUEST -> Icons.Rounded.Email
+                AuthTabMode.ADMIN -> Icons.Rounded.Shield
+              }
+              Icon(
+                icon,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+                tint = if (active) BgObsidian else TextMuted,
+              )
+              Spacer(Modifier.width(4.dp))
+              Text(
+                mode.label,
+                color = if (active) BgObsidian else TextMuted,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+              )
+            }
+          }
+        }
+      }
+
+      Spacer(Modifier.height(14.dp))
+
+      when {
+        isFirstRunAdminClaim -> {
+          Text("First-Run Admin Setup", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+          Text(
+            "Claim your Admin ID and password once to review Mail ID login requests and grant user access.",
+            color = TextMuted,
+            fontSize = 12.sp,
+            lineHeight = 17.sp,
+          )
+        }
+        tab == AuthTabMode.REQUEST -> {
+          Text("Request Login Access with Mail ID", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+          Text(
+            "Enter your Email ID, password, and Samsung/target phone model. Admin will grant your app access.",
+            color = TextMuted,
+            fontSize = 12.sp,
+            lineHeight = 17.sp,
+          )
+        }
+        tab == AuthTabMode.ADMIN -> {
+          Text("Administrator Sign In", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+          Text(
+            "Sign in with your Admin ID and password to grant access to Mail ID requests.",
+            color = TextMuted,
+            fontSize = 12.sp,
+            lineHeight = 17.sp,
+          )
+        }
+        else -> {
+          Text("User Sign In", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+          Text(
+            "Sign in with your approved Email ID (or User ID) and password.",
+            color = TextMuted,
+            fontSize = 12.sp,
+            lineHeight = 17.sp,
+          )
+        }
+      }
+
+      if (errorMsg != null) {
+        Spacer(Modifier.height(10.dp))
+        Surface(
+          modifier = Modifier.fillMaxWidth(),
+          color = RoseAccent.copy(alpha = 0.14f),
+          shape = RoundedCornerShape(8.dp),
+          border = BorderStroke(1.dp, RoseAccent.copy(alpha = 0.5f)),
+        ) {
+          Text(
+            errorMsg ?: "",
+            color = RoseAccent,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(10.dp),
+          )
+        }
+      }
+
+      if (statusMsg != null) {
+        Spacer(Modifier.height(10.dp))
+        Surface(
+          modifier = Modifier.fillMaxWidth(),
+          color = EmeraldAccent.copy(alpha = 0.14f),
+          shape = RoundedCornerShape(8.dp),
+          border = BorderStroke(1.dp, EmeraldAccent.copy(alpha = 0.5f)),
+        ) {
+          Text(
+            statusMsg ?: "",
+            color = EmeraldAccent,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(10.dp),
+          )
+        }
+      }
+
+      Spacer(Modifier.height(12.dp))
+
+      if (tab == AuthTabMode.REQUEST) {
+        OutlinedTextField(
+          value = email,
+          onValueChange = { email = it },
+          label = { Text("Email ID", fontSize = 12.sp) },
+          placeholder = { Text("player@gmail.com", fontSize = 12.sp) },
+          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+          singleLine = true,
+          modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+          OutlinedTextField(
+            value = displayName,
+            onValueChange = { displayName = it },
+            label = { Text("Player Name", fontSize = 12.sp) },
+            placeholder = { Text("Nickname", fontSize = 12.sp) },
+            singleLine = true,
+            modifier = Modifier.weight(1f),
+          )
+          OutlinedTextField(
+            value = customId,
+            onValueChange = { customId = it },
+            label = { Text("User ID (Opt)", fontSize = 12.sp) },
+            placeholder = { Text("Auto", fontSize = 12.sp) },
+            singleLine = true,
+            modifier = Modifier.weight(1f),
+          )
+        }
+        Spacer(Modifier.height(8.dp))
+        Text("Your Device", color = TextMuted, fontSize = 11.sp)
+        Spacer(Modifier.height(4.dp))
+        OutlinedButton(
+          onClick = { showDevicePicker = true },
+          modifier = Modifier.fillMaxWidth(),
+          border = BorderStroke(1.dp, BorderSlate),
+        ) {
+          Icon(Icons.Rounded.PhoneAndroid, contentDescription = null, modifier = Modifier.size(16.dp), tint = OrangeAccent)
+          Spacer(Modifier.width(6.dp))
+          Text(
+            "${selectedDeviceObj.brand} ${selectedDeviceObj.model}",
+            color = TextPrimary,
+            fontSize = 12.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+          )
+        }
+        Spacer(Modifier.height(8.dp))
+      } else {
+        OutlinedTextField(
+          value = customId,
+          onValueChange = { customId = it },
+          label = {
+            Text(
+              if (tab == AuthTabMode.ADMIN) "Admin ID" else "Email ID or User ID",
+              fontSize = 12.sp,
+            )
+          },
+          placeholder = {
+            Text(
+              when {
+                isFirstRunAdminClaim -> "Choose Admin ID (e.g. admin)"
+                tab == AuthTabMode.ADMIN -> "Enter Admin ID"
+                else -> "player@gmail.com or user_id"
+              },
+              fontSize = 12.sp,
+            )
+          },
+          keyboardOptions = KeyboardOptions(
+            keyboardType = if (tab == AuthTabMode.USER) KeyboardType.Email else KeyboardType.Text
+          ),
+          singleLine = true,
+          modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(8.dp))
+      }
+
+      OutlinedTextField(
+        value = password,
+        onValueChange = { password = it },
+        label = { Text("Password", fontSize = 12.sp) },
+        placeholder = {
+          Text(
+            when {
+              isFirstRunAdminClaim -> "Minimum 6 characters"
+              tab == AuthTabMode.REQUEST -> "Choose password (min 4 chars)"
+              else -> "Enter password"
+            },
+            fontSize = 12.sp,
+          )
+        },
+        visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+        trailingIcon = {
+          IconButton(onClick = { showPassword = !showPassword }) {
+            Icon(
+              if (showPassword) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
+              contentDescription = "Toggle password",
+              tint = TextMuted,
+            )
+          }
+        },
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth(),
+      )
+
+      if (tab == AuthTabMode.REQUEST) {
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+          value = note,
+          onValueChange = { note = it },
+          label = { Text("Note for Admin (Optional)", fontSize = 12.sp) },
+          placeholder = { Text("e.g. Need Samsung Galaxy A54 one-tap setup", fontSize = 12.sp) },
+          singleLine = true,
+          modifier = Modifier.fillMaxWidth(),
+        )
+      }
+
+      if (isFirstRunAdminClaim) {
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+          value = confirmPassword,
+          onValueChange = { confirmPassword = it },
+          label = { Text("Confirm Admin Password", fontSize = 12.sp) },
+          visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
+          keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+          singleLine = true,
+          modifier = Modifier.fillMaxWidth(),
+        )
+      }
+
+      Spacer(Modifier.height(14.dp))
+      Button(
+        onClick = {
+          errorMsg = null
+          statusMsg = null
+          when {
+            tab == AuthTabMode.REQUEST -> {
+              val (err, ok) = onRequestLogin(
+                email.trim(),
+                customId.trim(),
+                displayName.trim(),
+                password,
+                selectedDeviceId,
+                note.trim(),
+              )
+              if (err != null) {
+                errorMsg = err
+              } else {
+                statusMsg = ok
+                customId = email.trim().lowercase()
+                password = ""
+                note = ""
+                tab = AuthTabMode.USER
+              }
+            }
+            isFirstRunAdminClaim -> {
+              if (password != confirmPassword) {
+                errorMsg = "Passwords do not match."
+              } else {
+                errorMsg = onAdminClaim(customId.trim(), password)
+              }
+            }
+            tab == AuthTabMode.ADMIN -> {
+              errorMsg = onAdminLogin(customId.trim(), password)
+            }
+            else -> {
+              errorMsg = onUserLogin(customId.trim(), password)
+            }
+          }
+        },
+        modifier = Modifier.fillMaxWidth(),
+        colors = ButtonDefaults.buttonColors(containerColor = OrangeAccent, contentColor = BgObsidian),
+      ) {
+        Icon(
+          if (tab == AuthTabMode.REQUEST) Icons.Rounded.Send else Icons.Rounded.Lock,
+          contentDescription = null,
+          modifier = Modifier.size(16.dp),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+          when {
+            isFirstRunAdminClaim -> "Claim Admin & Sign In"
+            tab == AuthTabMode.REQUEST -> "Submit Mail ID Request"
+            tab == AuthTabMode.ADMIN -> "Sign In as Admin"
+            else -> "Sign In to App"
+          },
+          fontWeight = FontWeight.SemiBold,
+        )
+      }
+
+      if (tab == AuthTabMode.USER && !adminConfigured) {
+        Spacer(Modifier.height(10.dp))
+        TextButton(
+          onClick = {
+            tab = AuthTabMode.ADMIN
+            errorMsg = null
+            statusMsg = null
+          },
+          modifier = Modifier.fillMaxWidth(),
+        ) {
+          Text(
+            "First time? Switch to Admin Login to set up Admin & approve requests",
+            color = OrangeSoft,
+            fontSize = 11.sp,
+          )
+        }
+      }
+    }
+  }
+
+  if (showDevicePicker) {
+    DevicePickerDialog(
+      devices = devices,
+      selectedId = selectedDeviceId,
+      onSelect = {
+        selectedDeviceId = it.id
+        showDevicePicker = false
+      },
+      onDismiss = { showDevicePicker = false },
+    )
+  }
+}
+
+@Composable
+private fun DevicePickerDialog(
+  devices: List<DeviceSpec>,
+  selectedId: String,
+  onSelect: (DeviceSpec) -> Unit,
+  onDismiss: () -> Unit,
+) {
+  var q by remember { mutableStateOf("") }
+  val filtered = remember(devices, q) {
+    val clean = q.trim().lowercase()
+    if (clean.isEmpty()) devices
+    else devices.filter { "${it.brand} ${it.model} ${it.chipset}".lowercase().contains(clean) }
+  }
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    containerColor = SurfacePanel,
+    title = { Text("Select Target Device", color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+    text = {
+      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedTextField(
+          value = q,
+          onValueChange = { q = it },
+          placeholder = { Text("Search Samsung Galaxy, Moto...", fontSize = 12.sp) },
+          singleLine = true,
+          modifier = Modifier.fillMaxWidth(),
+        )
+        Column(
+          modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 280.dp)
+            .verticalScroll(rememberScrollState()),
+        ) {
+          filtered.forEach { d ->
+            val selected = d.id == selectedId
+            Row(
+              modifier = Modifier
+                .fillMaxWidth()
+                .background(if (selected) OrangeAccent.copy(alpha = 0.14f) else Color.Transparent)
+                .clickable { onSelect(d) }
+                .padding(horizontal = 8.dp, vertical = 9.dp),
+              horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+              Text(
+                "${d.brand} ${d.model}",
+                color = if (selected) OrangeSoft else TextPrimary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+              )
+              Text("${d.ramGb}GB", color = TextMuted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            }
+          }
+        }
+      }
+    },
+    confirmButton = {
+      TextButton(onClick = onDismiss) {
+        Text("Close", color = TextMuted)
+      }
+    },
+  )
+}
+
+@Composable
+fun AdminAccessScreen(
+  devices: List<DeviceSpec>,
+  requests: List<LocalAccessRequest>,
+  users: List<LocalAuthUser>,
+  onApproveRequest: (String) -> Unit,
+  onRejectRequest: (String) -> Unit,
+  onCreateUser: (
+    email: String,
+    customId: String,
+    displayName: String,
+    password: String,
+    deviceId: String,
+    role: AuthRole,
+  ) -> Pair<String?, String?>,
+  onToggleSuspend: (String) -> Unit,
+  onDeleteUser: (String) -> Unit,
+  onOpenCalibrationStudio: () -> Unit,
+) {
+  var email by remember { mutableStateOf("") }
+  var customId by remember { mutableStateOf("") }
+  var displayName by remember { mutableStateOf("") }
+  var password by remember { mutableStateOf("") }
+  var assignedDeviceId by remember { mutableStateOf("samsung-a54") }
+  var selectedRole by remember { mutableStateOf(AuthRole.USER) }
+  var showDevicePicker by remember { mutableStateOf(false) }
+  var formMsg by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
+
+  val pendingCount = requests.count { it.status == RequestStatus.PENDING }
+  val assignedDevice = remember(devices, assignedDeviceId) {
+    devices.find { it.id == assignedDeviceId } ?: devices.first()
+  }
+
+  Column(
+    modifier = Modifier
+      .fillMaxSize()
+      .verticalScroll(rememberScrollState())
+      .padding(horizontal = 16.dp, vertical = 14.dp),
+    verticalArrangement = Arrangement.spacedBy(14.dp),
+  ) {
+    PanelCard {
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+      ) {
+        Column(modifier = Modifier.weight(1f)) {
+          Text("ADMIN ACCESS CONTROL", color = OrangeAccent, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+          Text("Mail ID Requests & Users", color = TextPrimary, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+          Text(
+            "$pendingCount pending requests · ${users.size} provisioned accounts",
+            color = TextMuted,
+            fontSize = 12.sp,
+          )
+        }
+        OutlinedButton(
+          onClick = onOpenCalibrationStudio,
+          border = BorderStroke(1.dp, BorderSlate),
+          contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+        ) {
+          Text("Studio", color = OrangeSoft, fontSize = 12.sp)
+        }
+      }
+    }
+
+    // Pending & Recent Mail ID Requests
+    PanelCard {
+      Text("Mail ID Login Requests ($pendingCount Pending)", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+      Spacer(Modifier.height(8.dp))
+      if (requests.isEmpty()) {
+        Text("No login requests yet.", color = TextMuted, fontSize = 12.sp)
+      } else {
+        requests.forEachIndexed { idx, req ->
+          val devName = devices.find { it.id == req.requestedDeviceId }?.let { "${it.brand} ${it.model}" } ?: req.requestedDeviceId
+          Column(modifier = Modifier.padding(vertical = 8.dp)) {
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically,
+            ) {
+              Column(modifier = Modifier.weight(1f)) {
+                Text(req.email, color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace)
+                Text("${req.displayName} (@${req.customId}) · $devName", color = TextMuted, fontSize = 11.sp)
+                if (req.note.isNotBlank()) {
+                  Text("\"${req.note}\"", color = OrangeSoft, fontSize = 11.sp)
+                }
+              }
+              Text(
+                req.status.label.uppercase(),
+                color = when (req.status) {
+                  RequestStatus.APPROVED -> EmeraldAccent
+                  RequestStatus.REJECTED -> RoseAccent
+                  RequestStatus.PENDING -> AmberAccent
+                },
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+              )
+            }
+            if (req.status == RequestStatus.PENDING) {
+              Spacer(Modifier.height(8.dp))
+              Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                  onClick = { onApproveRequest(req.id) },
+                  modifier = Modifier.weight(1f),
+                  colors = ButtonDefaults.buttonColors(containerColor = EmeraldAccent, contentColor = BgObsidian),
+                ) {
+                  Icon(Icons.Rounded.Check, contentDescription = null, modifier = Modifier.size(15.dp))
+                  Spacer(Modifier.width(4.dp))
+                  Text("Grant Access", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                }
+                OutlinedButton(
+                  onClick = { onRejectRequest(req.id) },
+                  modifier = Modifier.weight(1f),
+                  border = BorderStroke(1.dp, RoseAccent.copy(alpha = 0.6f)),
+                ) {
+                  Icon(Icons.Rounded.Close, contentDescription = null, modifier = Modifier.size(15.dp), tint = RoseAccent)
+                  Spacer(Modifier.width(4.dp))
+                  Text("Reject", fontSize = 12.sp, color = RoseAccent)
+                }
+              }
+            }
+          }
+          if (idx < requests.lastIndex) {
+            HorizontalDivider(color = BorderSlate.copy(alpha = 0.6f))
+          }
+        }
+      }
+    }
+
+    // Create User / Admin Account directly
+    PanelCard {
+      Text("Create Account by Mail ID", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+      Spacer(Modifier.height(8.dp))
+      if (formMsg != null) {
+        val (isOk, msg) = formMsg!!
+        Surface(
+          modifier = Modifier.fillMaxWidth(),
+          color = (if (isOk) EmeraldAccent else RoseAccent).copy(alpha = 0.14f),
+          shape = RoundedCornerShape(8.dp),
+        ) {
+          Text(msg, color = if (isOk) EmeraldAccent else RoseAccent, fontSize = 12.sp, modifier = Modifier.padding(10.dp))
+        }
+        Spacer(Modifier.height(8.dp))
+      }
+      OutlinedTextField(
+        value = email,
+        onValueChange = { email = it },
+        label = { Text("Email ID", fontSize = 12.sp) },
+        placeholder = { Text("player@gmail.com", fontSize = 12.sp) },
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth(),
+      )
+      Spacer(Modifier.height(8.dp))
+      Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedTextField(
+          value = displayName,
+          onValueChange = { displayName = it },
+          label = { Text("Player Name", fontSize = 12.sp) },
+          singleLine = true,
+          modifier = Modifier.weight(1f),
+        )
+        OutlinedTextField(
+          value = customId,
+          onValueChange = { customId = it },
+          label = { Text("User ID (Opt)", fontSize = 12.sp) },
+          singleLine = true,
+          modifier = Modifier.weight(1f),
+        )
+      }
+      Spacer(Modifier.height(8.dp))
+      OutlinedTextField(
+        value = password,
+        onValueChange = { password = it },
+        label = { Text("Password", fontSize = 12.sp) },
+        placeholder = { Text("Min 4 chars (6+ for Admin)", fontSize = 12.sp) },
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth(),
+      )
+      Spacer(Modifier.height(8.dp))
+      OutlinedButton(
+        onClick = { showDevicePicker = true },
+        modifier = Modifier.fillMaxWidth(),
+        border = BorderStroke(1.dp, BorderSlate),
+      ) {
+        Text("Device: ${assignedDevice.brand} ${assignedDevice.model}", color = TextPrimary, fontSize = 12.sp)
+      }
+      Spacer(Modifier.height(8.dp))
+      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        AuthRole.entries.forEach { r ->
+          FilterChip(
+            modifier = Modifier.weight(1f),
+            selected = selectedRole == r,
+            onClick = { selectedRole = r },
+            label = { Text(if (r == AuthRole.ADMIN) "Admin Role" else "User Role", fontSize = 12.sp) },
+            colors = FilterChipDefaults.filterChipColors(
+              selectedContainerColor = OrangeAccent,
+              selectedLabelColor = BgObsidian,
+              containerColor = BgObsidian,
+              labelColor = TextMuted,
+            ),
+          )
+        }
+      }
+      Spacer(Modifier.height(10.dp))
+      Button(
+        onClick = {
+          val (err, ok) = onCreateUser(
+            email.trim(),
+            customId.trim(),
+            displayName.trim(),
+            password,
+            assignedDeviceId,
+            selectedRole,
+          )
+          if (err != null) {
+            formMsg = false to err
+          } else {
+            formMsg = true to (ok ?: "Account created")
+            email = ""
+            customId = ""
+            displayName = ""
+            password = ""
+          }
+        },
+        modifier = Modifier.fillMaxWidth(),
+        colors = ButtonDefaults.buttonColors(containerColor = OrangeAccent, contentColor = BgObsidian),
+      ) {
+        Text("Create & Grant Access", fontWeight = FontWeight.SemiBold)
+      }
+    }
+
+    // Approved Users Directory
+    PanelCard {
+      Text("Provisioned Users (${users.size})", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+      Spacer(Modifier.height(8.dp))
+      if (users.isEmpty()) {
+        Text("No users created yet.", color = TextMuted, fontSize = 12.sp)
+      } else {
+        users.forEachIndexed { idx, user ->
+          Row(
+            modifier = Modifier
+              .fillMaxWidth()
+              .padding(vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            Column(modifier = Modifier.weight(1f)) {
+              Text(
+                "${user.displayName} (${if (user.role == AuthRole.ADMIN) "ADMIN" else "USER"})",
+                color = if (user.suspended) RoseAccent else TextPrimary,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+              )
+              Text(
+                user.email.ifBlank { "@${user.customId}" },
+                color = TextMuted,
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+              )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+              TextButton(onClick = { onToggleSuspend(user.id) }) {
+                Text(
+                  if (user.suspended) "Activate" else "Suspend",
+                  color = if (user.suspended) EmeraldAccent else AmberAccent,
+                  fontSize = 11.sp,
+                )
+              }
+              IconButton(onClick = { onDeleteUser(user.id) }) {
+                Icon(Icons.Rounded.Delete, contentDescription = "Delete", tint = RoseAccent, modifier = Modifier.size(18.dp))
+              }
+            }
+          }
+          if (idx < users.lastIndex) {
+            HorizontalDivider(color = BorderSlate.copy(alpha = 0.6f))
+          }
+        }
+      }
+    }
+  }
+
+  if (showDevicePicker) {
+    DevicePickerDialog(
+      devices = devices,
+      selectedId = assignedDeviceId,
+      onSelect = {
+        assignedDeviceId = it.id
+        showDevicePicker = false
+      },
+      onDismiss = { showDevicePicker = false },
     )
   }
 }

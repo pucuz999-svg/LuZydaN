@@ -379,6 +379,39 @@ export function buildOptimizationChecklist(device: DeviceSpec): OptimizationStep
           'Open Moto Gametime while in Free Fire to block swipe gestures/notifications, lock display refresh rate, and prioritize digitizer touch polling.',
         osScope: 'Android',
       });
+    } else if (device.brand === 'Samsung') {
+      steps.push({
+        id: 'samsung-gamebooster',
+        category: 'Display & Touch',
+        title: 'Enable Samsung Game Booster & Touch Sensitivity',
+        settingValue: `Game Booster: Performance · Touch Sensitivity: On · ${device.refreshHz} Hz`,
+        impact: 'High',
+        description:
+          'In Settings > Display turn on Touch Sensitivity, and in Gaming Hub > Game Booster set Game Optimization to Performance with Priority Mode enabled.',
+        osScope: 'Android',
+      });
+    } else if (device.brand === 'Xiaomi' || device.brand === 'POCO') {
+      steps.push({
+        id: 'xiaomi-gameturbo',
+        category: 'Display & Touch',
+        title: 'Tune Xiaomi / POCO Game Turbo Touch Response',
+        settingValue: `Game Turbo: Performance Mode · Touch Response: High · ${device.refreshHz} Hz`,
+        impact: 'High',
+        description:
+          'In Security > Game Turbo > Additional Settings for Free Fire, raise Touch Response and Sensitivity to high, enable Memory Exceptions, and turn off Enhanced Visuals to stabilize drag swipes.',
+        osScope: 'Android',
+      });
+    } else if (device.brand === 'Vivo' || device.brand === 'iQOO') {
+      steps.push({
+        id: 'vivo-ultragamemode',
+        category: 'Display & Touch',
+        title: 'Enable Vivo Ultra Game Mode & Esports Mode',
+        settingValue: `Ultra Game Mode: Esports · Multi-Turbo Boost · ${device.refreshHz} Hz`,
+        impact: 'High',
+        description:
+          'Enable Ultra Game Mode and Esports Mode in Settings (or Monster Mode on iQOO) to lock high touch-sampling priority, disable background calls, and maintain stable frame pacing.',
+        osScope: 'Android',
+      });
     }
   } else {
     steps.push(

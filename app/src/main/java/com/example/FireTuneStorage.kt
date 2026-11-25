@@ -185,4 +185,126 @@ class FireTuneStorage(context: Context) {
     o.put("muteInAppAlerts", settings.muteInAppAlerts)
     prefs.edit().putString("notification_block", o.toString()).apply()
   }
+
+  fun loadAdminConfig(): LocalAdminConfig? {
+    val raw = prefs.getString("local_admin_config", null) ?: return null
+    return runCatching {
+      val o = JSONObject(raw)
+      LocalAdminConfig(
+        adminId = o.getString("adminId"),
+        passwordHash = o.getString("passwordHash"),
+        passwordSalt = o.getString("passwordSalt"),
+      )
+    }.getOrNull()
+  }
+
+  fun saveAdminConfig(config: LocalAdminConfig) {
+    val o = JSONObject()
+    o.put("adminId", config.adminId)
+    o.put("passwordHash", config.passwordHash)
+    o.put("passwordSalt", config.passwordSalt)
+    prefs.edit().putString("local_admin_config", o.toString()).apply()
+  }
+
+  fun loadAuthUsers(): List<LocalAuthUser> {
+    val raw = prefs.getString("local_auth_users", null) ?: return emptyList()
+    return runCatching {
+      val arr = JSONArray(raw)
+      buildList {
+        for (i in 0 until arr.length()) {
+          val o = arr.getJSONObject(i)
+          add(
+            LocalAuthUser(
+              id = o.getString("id"),
+              email = o.optString("email", ""),
+              customId = o.getString("customId"),
+              displayName = o.getString("displayName"),
+              role = AuthRole.valueOf(o.getString("role")),
+              passwordHash = o.getString("passwordHash"),
+              passwordSalt = o.getString("passwordSalt"),
+              assignedDeviceId = o.optString("assignedDeviceId", "samsung-a54"),
+              suspended = o.optBoolean("suspended", false),
+              createdAt = o.optString("createdAt", ""),
+            )
+          )
+        }
+      }
+    }.getOrDefault(emptyList())
+  }
+
+  fun saveAuthUsers(users: List<LocalAuthUser>) {
+    val arr = JSONArray()
+    users.forEach { u ->
+      val o = JSONObject()
+      o.put("id", u.id)
+      o.put("email", u.email)
+      o.put("customId", u.customId)
+      o.put("displayName", u.displayName)
+      o.put("role", u.role.name)
+      o.put("passwordHash", u.passwordHash)
+      o.put("passwordSalt", u.passwordSalt)
+      o.put("assignedDeviceId", u.assignedDeviceId)
+      o.put("suspended", u.suspended)
+      o.put("createdAt", u.createdAt)
+      arr.put(o)
+    }
+    prefs.edit().putString("local_auth_users", arr.toString()).apply()
+  }
+
+  fun loadAccessRequests(): List<LocalAccessRequest> {
+    val raw = prefs.getString("local_access_requests", null) ?: return emptyList()
+    return runCatching {
+      val arr = JSONArray(raw)
+      buildList {
+        for (i in 0 until arr.length()) {
+          val o = arr.getJSONObject(i)
+          add(
+            LocalAccessRequest(
+              id = o.getString("id"),
+              email = o.getString("email"),
+              customId = o.getString("customId"),
+              displayName = o.getString("displayName"),
+              passwordHash = o.getString("passwordHash"),
+              passwordSalt = o.getString("passwordSalt"),
+              requestedDeviceId = o.optString("requestedDeviceId", "samsung-a54"),
+              note = o.optString("note", ""),
+              status = RequestStatus.valueOf(o.getString("status")),
+              createdAt = o.optString("createdAt", ""),
+              decidedAt = if (o.has("decidedAt") && !o.isNull("decidedAt")) o.getString("decidedAt") else null,
+            )
+          )
+        }
+      }
+    }.getOrDefault(emptyList())
+  }
+
+  fun saveAccessRequests(requests: List<LocalAccessRequest>) {
+    val arr = JSONArray()
+    requests.forEach { r ->
+      val o = JSONObject()
+      o.put("id", r.id)
+      o.put("email", r.email)
+      o.put("customId", r.customId)
+      o.put("displayName", r.displayName)
+      o.put("passwordHash", r.passwordHash)
+      o.put("passwordSalt", r.passwordSalt)
+      o.put("requestedDeviceId", r.requestedDeviceId)
+      o.put("note", r.note)
+      o.put("status", r.status.name)
+      o.put("createdAt", r.createdAt)
+      if (r.decidedAt != null) o.put("decidedAt", r.decidedAt)
+      arr.put(o)
+    }
+    prefs.edit().putString("local_access_requests", arr.toString()).apply()
+  }
+
+  fun loadSessionUserId(): String? = prefs.getString("local_session_user_id", null)
+
+  fun saveSessionUserId(userId: String?) {
+    if (userId == null) {
+      prefs.edit().remove("local_session_user_id").apply()
+    } else {
+      prefs.edit().putString("local_session_user_id", userId).apply()
+    }
+  }
 }

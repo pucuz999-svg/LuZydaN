@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AdminPanelSettings
 import androidx.compose.material.icons.rounded.Bookmark
 import androidx.compose.material.icons.rounded.RocketLaunch
 import androidx.compose.material.icons.rounded.Speed
@@ -38,6 +39,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -84,6 +86,7 @@ private enum class FireTuneTab(val label: String) {
   PERFORMANCE("FPS Boost"),
   DRAG_LAB("Drag Lab"),
   SAVED("Saved"),
+  ADMIN("Admin"),
 }
 
 @Composable
@@ -98,6 +101,31 @@ fun FireTuneApp() {
   var checklistMap by remember { mutableStateOf(storage.loadChecklistMap()) }
   var notificationBlock by remember { mutableStateOf(storage.loadNotificationBlock()) }
 
+  var adminConfig by remember { mutableStateOf(storage.loadAdminConfig()) }
+  var authUsers by remember { mutableStateOf(storage.loadAuthUsers()) }
+  var accessRequests by remember { mutableStateOf(storage.loadAccessRequests()) }
+  var sessionUserId by remember { mutableStateOf(storage.loadSessionUserId()) }
+
+  val activeAuthUser = remember(adminConfig, authUsers, sessionUserId) {
+    val sid = sessionUserId ?: return@remember null
+    if (sid == "root-admin" && adminConfig != null) {
+      LocalAuthUser(
+        id = "root-admin",
+        email = "",
+        customId = adminConfig!!.adminId,
+        displayName = "Root Admin (${adminConfig!!.adminId})",
+        role = AuthRole.ADMIN,
+        passwordHash = "",
+        passwordSalt = "",
+        assignedDeviceId = "samsung-s24-ultra",
+        suspended = false,
+        createdAt = "",
+      )
+    } else {
+      authUsers.find { it.id == sid && !it.suspended }
+    }
+  }
+
   val detectedDevice = remember(context) { detectCurrentAndroidDevice(context) }
   val allDevices = remember(customDevices, detectedDevice) {
     customDevices + listOf(detectedDevice) + DEVICE_CATALOG
@@ -108,6 +136,134 @@ fun FireTuneApp() {
   var playstyle by remember { mutableStateOf(PlaystyleId.ONE_TAP) }
   var grip by remember { mutableStateOf(GripType.TWO_FINGER) }
   var rangeBias by remember { mutableStateOf(RangeBias.MID) }
+
+  if (activeAuthUser == null) {
+    AuthGateScreen(
+      devices = allDevices,
+      adminConfigured = adminConfig != null || authUsers.any { it.role == AuthRole.ADMIN && !it.suspended },
+      onUserLogin = { identifier, password ->
+        val clean = identifier.trim().lowercase()
+        if (clean.isEmpty() || password.isEmpty()) {
+          return@AuthGateScreen "Enter your Email ID (or User ID) and password."
+        }
+        val matchedUser = authUsers.find {
+          it.role == AuthRole.USER &&
+            (it.email.equals(clean, ignoreCase = true) || it.customId.equals(clean, ignoreCase = true))
+        }
+        if (matchedUser == null) {
+          val pending = accessRequests.find {
+            it.email.equals(clean, ignoreCase = true) || it.customId.equals(clean, ignoreCase = true)
+          }
+          return@AuthGateScreen when (pending?.status) {
+            RequestStatus.PENDING -> "Your login request is pending Admin approval."
+            RequestStatus.REJECTED -> "Your login request was declined by an Admin."
+            else -> "Invalid Email ID / User ID or password."
+          }
+        }
+        if (matchedUser.suspended) {
+          return@AuthGateScreen "This account is suspended. Contact Admin."
+        }
+        if (!LocalAuthCrypto.verifyPassword(password, matchedUser.passwordSalt, matchedUser.passwordHash)) {
+          return@AuthGateScreen "Invalid Email ID / User ID or password."
+        }
+        sessionUserId = matchedUser.id
+        storage.saveSessionUserId(matchedUser.id)
+        if (allDevices.any { it.id == matchedUser.assignedDeviceId }) {
+          selectedDeviceId = matchedUser.assignedDeviceId
+        }
+        activeTab = FireTuneTab.SENSITIVITY
+        null
+      },
+      onRequestLogin = { email, customIdInput, displayNameInput, password, deviceId, note ->
+        val cleanEmail = email.trim().lowercase()
+        if (!LocalAuthCrypto.isValidEmail(cleanEmail)) {
+          return@AuthGateScreen "Please enter a valid Email ID (e.g. player@gmail.com)." to null
+        }
+        if (password.length < 4) {
+          return@AuthGateScreen "Password must be at least 4 characters." to null
+        }
+        val resolvedId =
+          customIdInput.trim().lowercase().ifEmpty { LocalAuthCrypto.deriveCustomIdFromEmail(cleanEmail) }
+        val emailTaken =
+          authUsers.any { it.email.equals(cleanEmail, ignoreCase = true) } ||
+            accessRequests.any { it.status == RequestStatus.PENDING && it.email.equals(cleanEmail, ignoreCase = true) }
+        if (emailTaken) {
+          return@AuthGateScreen "A user or pending request with this Email ID already exists." to null
+        }
+        val idTaken =
+          authUsers.any { it.customId.equals(resolvedId, ignoreCase = true) } ||
+            accessRequests.any { it.status == RequestStatus.PENDING && it.customId.equals(resolvedId, ignoreCase = true) }
+        val finalCustomId = if (idTaken) "${resolvedId}_${(100..999).random()}" else resolvedId
+        val salt = LocalAuthCrypto.generateSalt()
+        val hash = LocalAuthCrypto.hashPassword(password, salt)
+        val nowStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        val req = LocalAccessRequest(
+          id = "req-${System.currentTimeMillis()}",
+          email = cleanEmail,
+          customId = finalCustomId,
+          displayName = displayNameInput.trim().ifEmpty { finalCustomId },
+          passwordHash = hash,
+          passwordSalt = salt,
+          requestedDeviceId = deviceId,
+          note = note,
+          status = RequestStatus.PENDING,
+          createdAt = nowStr,
+        )
+        val nextReqs = listOf(req) + accessRequests
+        accessRequests = nextReqs
+        storage.saveAccessRequests(nextReqs)
+        null to "Request submitted for $cleanEmail (@$finalCustomId). Ask Admin to grant access, then sign in here."
+      },
+      onAdminClaim = { adminId, password ->
+        val cleanId = adminId.trim().lowercase()
+        if (cleanId.length < 2) {
+          return@AuthGateScreen "Admin ID must be at least 2 characters."
+        }
+        if (password.length < 6) {
+          return@AuthGateScreen "Admin password must be at least 6 characters."
+        }
+        val salt = LocalAuthCrypto.generateSalt()
+        val hash = LocalAuthCrypto.hashPassword(password, salt)
+        val cfg = LocalAdminConfig(cleanId, hash, salt)
+        adminConfig = cfg
+        storage.saveAdminConfig(cfg)
+        sessionUserId = "root-admin"
+        storage.saveSessionUserId("root-admin")
+        activeTab = FireTuneTab.ADMIN
+        null
+      },
+      onAdminLogin = { adminId, password ->
+        val cleanId = adminId.trim().lowercase()
+        if (cleanId.isEmpty() || password.isEmpty()) {
+          return@AuthGateScreen "Enter Admin ID and password."
+        }
+        val rootCfg = adminConfig
+        if (rootCfg != null && rootCfg.adminId.equals(cleanId, ignoreCase = true) &&
+          LocalAuthCrypto.verifyPassword(password, rootCfg.passwordSalt, rootCfg.passwordHash)
+        ) {
+          sessionUserId = "root-admin"
+          storage.saveSessionUserId("root-admin")
+          activeTab = FireTuneTab.ADMIN
+          return@AuthGateScreen null
+        }
+        val adminUser = authUsers.find {
+          it.role == AuthRole.ADMIN &&
+            !it.suspended &&
+            (it.customId.equals(cleanId, ignoreCase = true) || it.email.equals(cleanId, ignoreCase = true))
+        }
+        if (adminUser != null &&
+          LocalAuthCrypto.verifyPassword(password, adminUser.passwordSalt, adminUser.passwordHash)
+        ) {
+          sessionUserId = adminUser.id
+          storage.saveSessionUserId(adminUser.id)
+          activeTab = FireTuneTab.ADMIN
+          return@AuthGateScreen null
+        }
+        "Invalid Admin ID or password."
+      },
+    )
+    return
+  }
 
   val selectedDevice = remember(allDevices, selectedDeviceId) {
     allDevices.find { it.id == selectedDeviceId } ?: allDevices.first()
@@ -160,6 +316,14 @@ fun FireTuneApp() {
     }
   }
 
+  val visibleTabs = remember(activeAuthUser) {
+    if (activeAuthUser.role == AuthRole.ADMIN) {
+      FireTuneTab.entries
+    } else {
+      listOf(FireTuneTab.SENSITIVITY, FireTuneTab.PERFORMANCE, FireTuneTab.DRAG_LAB, FireTuneTab.SAVED)
+    }
+  }
+
   Scaffold(
     modifier = Modifier.fillMaxSize(),
     containerColor = BgObsidian,
@@ -170,49 +334,68 @@ fun FireTuneApp() {
           Row(
             modifier = Modifier
               .fillMaxWidth()
-              .padding(horizontal = 16.dp, vertical = 12.dp),
+              .padding(horizontal = 16.dp, vertical = 10.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
           ) {
-            Text(
-              text = buildAnnotatedString {
-                withStyle(SpanStyle(color = TextPrimary, fontWeight = FontWeight.Bold)) {
-                  append("Fire")
-                }
-                withStyle(SpanStyle(color = OrangeAccent, fontWeight = FontWeight.Bold)) {
-                  append("Tune")
-                }
-              },
-              fontSize = 21.sp,
-            )
+            androidx.compose.foundation.layout.Column(modifier = Modifier.weight(1f)) {
+              Text(
+                text = buildAnnotatedString {
+                  withStyle(SpanStyle(color = TextPrimary, fontWeight = FontWeight.Bold)) {
+                    append("Fire")
+                  }
+                  withStyle(SpanStyle(color = OrangeAccent, fontWeight = FontWeight.Bold)) {
+                    append("Tune")
+                  }
+                },
+                fontSize = 20.sp,
+              )
+              Text(
+                text = if (activeAuthUser.role == AuthRole.ADMIN) "Admin · ${activeAuthUser.customId}" else activeAuthUser.email.ifBlank { activeAuthUser.customId },
+                color = TextMuted,
+                fontSize = 10.sp,
+              )
+            }
 
-            Button(
-              onClick = {
-                val steps = buildOptimizationChecklist(selectedDevice).map { it.id }.toSet()
-                val nextMap = checklistMap.toMutableMap()
-                nextMap[selectedDevice.id] = steps
-                checklistMap = nextMap
-                storage.saveChecklistMap(nextMap)
-                appliedStepsCount = steps.size
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+              TextButton(
+                onClick = {
+                  sessionUserId = null
+                  storage.saveSessionUserId(null)
+                },
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+              ) {
+                Text("Sign Out", color = TextMuted, fontSize = 11.sp)
+              }
 
-                val summary = formatSetupAsText(
-                  selectedDevice,
-                  sensitivityOverrides,
-                  fireButtonOverride,
-                  calibration,
-                  playstyle,
-                  grip,
-                )
-                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                cm?.setPrimaryClip(ClipData.newPlainText("FireTune Setup", summary))
-                showLaunchModal = true
-              },
-              contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
-              colors = ButtonDefaults.buttonColors(containerColor = OrangeAccent, contentColor = BgObsidian),
-            ) {
-              Icon(Icons.Rounded.RocketLaunch, contentDescription = null, modifier = Modifier.size(16.dp))
-              Spacer(Modifier.width(6.dp))
-              Text("Apply & Launch", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+              Button(
+                onClick = {
+                  val steps = buildOptimizationChecklist(selectedDevice).map { it.id }.toSet()
+                  val nextMap = checklistMap.toMutableMap()
+                  nextMap[selectedDevice.id] = steps
+                  checklistMap = nextMap
+                  storage.saveChecklistMap(nextMap)
+                  appliedStepsCount = steps.size
+
+                  val summary = formatSetupAsText(
+                    selectedDevice,
+                    sensitivityOverrides,
+                    fireButtonOverride,
+                    calibration,
+                    playstyle,
+                    grip,
+                  )
+                  val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                  cm?.setPrimaryClip(ClipData.newPlainText("FireTune Setup", summary))
+                  showLaunchModal = true
+                },
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = OrangeAccent, contentColor = BgObsidian),
+              ) {
+                Icon(Icons.Rounded.RocketLaunch, contentDescription = null, modifier = Modifier.size(15.dp))
+                Spacer(Modifier.width(5.dp))
+                Text("Apply", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+              }
             }
           }
           HorizontalDivider(color = BorderSlate)
@@ -221,19 +404,20 @@ fun FireTuneApp() {
     },
     bottomBar = {
       NavigationBar(containerColor = SurfacePanel, tonalElevation = 0.dp) {
-        FireTuneTab.entries.forEach { tab ->
+        visibleTabs.forEach { tab ->
           val selected = activeTab == tab
           val icon = when (tab) {
             FireTuneTab.SENSITIVITY -> Icons.Rounded.Tune
             FireTuneTab.PERFORMANCE -> Icons.Rounded.Speed
             FireTuneTab.DRAG_LAB -> Icons.Rounded.TrackChanges
             FireTuneTab.SAVED -> Icons.Rounded.Bookmark
+            FireTuneTab.ADMIN -> Icons.Rounded.AdminPanelSettings
           }
           NavigationBarItem(
             selected = selected,
             onClick = { activeTab = tab },
             icon = { Icon(icon, contentDescription = tab.label) },
-            label = { Text(tab.label, fontSize = 11.sp) },
+            label = { Text(tab.label, fontSize = 10.sp) },
             colors = NavigationBarItemDefaults.colors(
               selectedIconColor = OrangeAccent,
               selectedTextColor = OrangeAccent,
@@ -348,7 +532,7 @@ fun FireTuneApp() {
               appendLine("Heads-Up Banners: ${if (notificationBlock.blockHeadsUp) "BLOCKED" else "ALLOW"}")
               appendLine("Incoming Calls: ${if (notificationBlock.blockCalls) "BLOCKED" else "ALLOW"}")
               appendLine("Floating Bubbles: ${if (notificationBlock.blockFloatingBubbles) "BLOCKED" else "ALLOW"}")
-              appendLine("Apply: Settings > Notifications > Do Not Disturb + Game Space / Moto Gametime")
+              appendLine("Apply: Settings > Notifications > Do Not Disturb + Game Space / Samsung Game Booster")
             }
             copyToClipboard(guide, "Notification block guide copied")
           },
@@ -396,6 +580,96 @@ fun FireTuneApp() {
             savedProfiles = next
             storage.saveSavedProfiles(next)
           },
+        )
+
+        FireTuneTab.ADMIN -> AdminAccessScreen(
+          devices = allDevices,
+          requests = accessRequests,
+          users = authUsers,
+          onApproveRequest = { reqId ->
+            val req = accessRequests.find { it.id == reqId } ?: return@AdminAccessScreen
+            val nowStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+            val nextReqs = accessRequests.map {
+              if (it.id == reqId) it.copy(status = RequestStatus.APPROVED, decidedAt = nowStr) else it
+            }
+            val alreadyUser = authUsers.any { it.email.equals(req.email, ignoreCase = true) }
+            val nextUsers = if (alreadyUser) authUsers else {
+              listOf(
+                LocalAuthUser(
+                  id = "usr-${System.currentTimeMillis()}",
+                  email = req.email,
+                  customId = req.customId,
+                  displayName = req.displayName,
+                  role = AuthRole.USER,
+                  passwordHash = req.passwordHash,
+                  passwordSalt = req.passwordSalt,
+                  assignedDeviceId = req.requestedDeviceId,
+                  suspended = false,
+                  createdAt = nowStr,
+                )
+              ) + authUsers
+            }
+            accessRequests = nextReqs
+            authUsers = nextUsers
+            storage.saveAccessRequests(nextReqs)
+            storage.saveAuthUsers(nextUsers)
+            scope.launch { snackbarHostState.showSnackbar("Granted access to ${req.email}") }
+          },
+          onRejectRequest = { reqId ->
+            val nowStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+            val nextReqs = accessRequests.map {
+              if (it.id == reqId) it.copy(status = RequestStatus.REJECTED, decidedAt = nowStr) else it
+            }
+            accessRequests = nextReqs
+            storage.saveAccessRequests(nextReqs)
+            scope.launch { snackbarHostState.showSnackbar("Request rejected") }
+          },
+          onCreateUser = { emailInput, customIdInput, displayNameInput, pwInput, devId, role ->
+            val cleanEmail = emailInput.trim().lowercase()
+            if (!LocalAuthCrypto.isValidEmail(cleanEmail)) {
+              return@AdminAccessScreen "Please enter a valid Email ID." to null
+            }
+            val minLen = if (role == AuthRole.ADMIN) 6 else 4
+            if (pwInput.length < minLen) {
+              return@AdminAccessScreen "Password must be at least $minLen characters." to null
+            }
+            if (authUsers.any { it.email.equals(cleanEmail, ignoreCase = true) }) {
+              return@AdminAccessScreen "Account with this Email ID already exists." to null
+            }
+            val resolvedId = customIdInput.trim().lowercase().ifEmpty { LocalAuthCrypto.deriveCustomIdFromEmail(cleanEmail) }
+            val salt = LocalAuthCrypto.generateSalt()
+            val hash = LocalAuthCrypto.hashPassword(pwInput, salt)
+            val nowStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+            val newUser = LocalAuthUser(
+              id = "usr-${System.currentTimeMillis()}",
+              email = cleanEmail,
+              customId = resolvedId,
+              displayName = displayNameInput.trim().ifEmpty { resolvedId },
+              role = role,
+              passwordHash = hash,
+              passwordSalt = salt,
+              assignedDeviceId = devId,
+              suspended = false,
+              createdAt = nowStr,
+            )
+            val nextUsers = listOf(newUser) + authUsers
+            authUsers = nextUsers
+            storage.saveAuthUsers(nextUsers)
+            null to "Created ${role.name.lowercase()} account for $cleanEmail"
+          },
+          onToggleSuspend = { userId ->
+            val nextUsers = authUsers.map {
+              if (it.id == userId) it.copy(suspended = !it.suspended) else it
+            }
+            authUsers = nextUsers
+            storage.saveAuthUsers(nextUsers)
+          },
+          onDeleteUser = { userId ->
+            val nextUsers = authUsers.filterNot { it.id == userId }
+            authUsers = nextUsers
+            storage.saveAuthUsers(nextUsers)
+          },
+          onOpenCalibrationStudio = { activeTab = FireTuneTab.SENSITIVITY },
         )
       }
     }

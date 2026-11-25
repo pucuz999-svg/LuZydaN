@@ -10,6 +10,7 @@ dotenv.config();
 interface CustomerRecord {
   id: string;
   customId: string;
+  email?: string;
   displayName: string;
   passwordHash: string;
   assignedDeviceId: string;
@@ -38,6 +39,7 @@ interface AdminRecord {
 interface CustomerRequestRecord {
   id: string;
   customId: string;
+  email?: string;
   displayName: string;
   passwordHash: string;
   requestedDeviceId: string;
@@ -60,6 +62,7 @@ interface SessionPayload {
   sub: string;
   role: 'admin' | 'customer';
   customId: string;
+  email?: string;
   displayName: string;
   assignedDeviceId?: string;
   exp: number;
@@ -69,6 +72,39 @@ interface AuthenticatedRequest extends Request {
   authUser?: SessionPayload;
 }
 
+interface SensitivityValuesRecord {
+  general: number;
+  redDot: number;
+  scope2x: number;
+  scope4x: number;
+  sniperScope: number;
+  freeLook: number;
+}
+
+interface DeviceSpecRecord {
+  id: string;
+  brand: string;
+  model: string;
+  tier: 'low' | 'mid' | 'high' | 'gaming' | 'ios';
+  os: 'Android' | 'iOS';
+  ramGb: number;
+  refreshHz: number;
+  touchSamplingHz: number;
+  ppi: number;
+  screenInches: number;
+  chipset: string;
+  defaultDpi: number;
+  recommendedDpi: number;
+  thermalHeadroom: 'Tight' | 'Moderate' | 'High';
+  presetSensitivity?: SensitivityValuesRecord;
+  presetFireButton?: number;
+}
+
+interface CatalogStoreData {
+  upsertedDevices: DeviceSpecRecord[];
+  removedIds: string[];
+}
+
 const PORT = 3000;
 const SESSION_SECRET =
   process.env.AUTH_SESSION_SECRET || crypto.randomBytes(32).toString('hex');
@@ -76,8 +112,9 @@ const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const STORE_PATH = path.resolve(DATA_DIR, 'auth-store.json');
+const CATALOG_PATH = path.resolve(DATA_DIR, 'device-catalog.json');
 
-if (!STORE_PATH.startsWith(DATA_DIR + path.sep)) {
+if (!STORE_PATH.startsWith(DATA_DIR + path.sep) || !CATALOG_PATH.startsWith(DATA_DIR + path.sep)) {
   throw new Error('Invalid store path configuration');
 }
 
@@ -119,6 +156,222 @@ function saveStore(data: AuthStoreData): void {
   }
   fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), { mode: 0o600 });
   fs.renameSync(tempPath, STORE_PATH);
+}
+
+function readCatalogStore(): CatalogStoreData {
+  if (!fs.existsSync(CATALOG_PATH)) {
+    return { upsertedDevices: [], removedIds: [] };
+  }
+  try {
+    const raw = fs.readFileSync(CATALOG_PATH, 'utf8');
+    const parsed = JSON.parse(raw) as Partial<CatalogStoreData>;
+    return {
+      upsertedDevices: Array.isArray(parsed.upsertedDevices) ? parsed.upsertedDevices : [],
+      removedIds: Array.isArray(parsed.removedIds)
+        ? parsed.removedIds.filter((id): id is string => typeof id === 'string')
+        : [],
+    };
+  } catch {
+    return { upsertedDevices: [], removedIds: [] };
+  }
+}
+
+function saveCatalogStore(data: CatalogStoreData): void {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  const tempPath = path.resolve(DATA_DIR, `device-catalog.${process.pid}.tmp`);
+  if (!tempPath.startsWith(DATA_DIR + path.sep)) {
+    throw new Error('Invalid temp catalog path');
+  }
+  fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+  fs.renameSync(tempPath, CATALOG_PATH);
+}
+
+const VALID_TIERS = new Set(['low', 'mid', 'high', 'gaming', 'ios']);
+const VALID_OS = new Set(['Android', 'iOS']);
+const VALID_THERMAL = new Set(['Tight', 'Moderate', 'High']);
+const DEVICE_ID_REGEX = /^[a-zA-Z0-9._-]{2,64}$/;
+
+function slugifyDeviceId(brand: string, model: string): string {
+  const slug = `${brand}-${model}`
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+  return slug.length >= 2 ? slug : `device-${Date.now()}`;
+}
+
+function parseBoundedInt(value: unknown, min: number, max: number, fallback?: number): number | null {
+  if (value === undefined || value === null || value === '') {
+    return fallback !== undefined ? fallback : null;
+  }
+  const num = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(num)) return null;
+  const rounded = Math.round(num);
+  if (rounded < min || rounded > max) return null;
+  return rounded;
+}
+
+function parseBoundedFloat(value: unknown, min: number, max: number, fallback: number): number | null {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+  const num = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(num) || num < min || num > max) return null;
+  return Math.round(num * 100) / 100;
+}
+
+function sanitizeAndValidateDeviceSpec(
+  raw: unknown
+): { ok: true; device: DeviceSpecRecord } | { ok: false; error: string } {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, error: 'Device entry must be a JSON object.' };
+  }
+  const input = raw as Record<string, unknown>;
+  const brand = typeof input.brand === 'string' ? input.brand.trim().slice(0, 40) : '';
+  const model = typeof input.model === 'string' ? input.model.trim().slice(0, 80) : '';
+  if (!brand || !model) {
+    return { ok: false, error: 'Brand and model are required.' };
+  }
+
+  const rawId = typeof input.id === 'string' ? input.id.trim() : '';
+  const id = rawId ? rawId : slugifyDeviceId(brand, model);
+  if (!DEVICE_ID_REGEX.test(id)) {
+    return {
+      ok: false,
+      error: `Invalid device ID "${id}". Use 2-64 letters, numbers, ".", "_", or "-".`,
+    };
+  }
+
+  const ramGb = parseBoundedInt(input.ramGb, 1, 32, 8);
+  if (ramGb === null) {
+    return { ok: false, error: `Invalid RAM GB for ${brand} ${model} (expected 1-32).` };
+  }
+
+  const osRaw = typeof input.os === 'string' ? input.os.trim() : '';
+  const os: 'Android' | 'iOS' =
+    osRaw && VALID_OS.has(osRaw)
+      ? (osRaw as 'Android' | 'iOS')
+      : brand.toLowerCase() === 'apple'
+        ? 'iOS'
+        : 'Android';
+
+  const tierRaw = typeof input.tier === 'string' ? input.tier.trim().toLowerCase() : '';
+  const tier: 'low' | 'mid' | 'high' | 'gaming' | 'ios' =
+    tierRaw && VALID_TIERS.has(tierRaw)
+      ? (tierRaw as DeviceSpecRecord['tier'])
+      : os === 'iOS'
+        ? 'ios'
+        : ramGb <= 3
+          ? 'low'
+          : ramGb <= 6
+            ? 'mid'
+            : 'high';
+
+  const refreshHz = parseBoundedInt(input.refreshHz, 30, 240, 120);
+  if (refreshHz === null) {
+    return { ok: false, error: `Invalid refreshHz for ${brand} ${model} (expected 30-240).` };
+  }
+
+  const touchSamplingHz = parseBoundedInt(input.touchSamplingHz, 60, 1000, refreshHz >= 120 ? 240 : 120);
+  if (touchSamplingHz === null) {
+    return { ok: false, error: `Invalid touchSamplingHz for ${brand} ${model} (expected 60-1000).` };
+  }
+
+  const ppi = parseBoundedInt(input.ppi, 120, 700, 400);
+  if (ppi === null) {
+    return { ok: false, error: `Invalid PPI for ${brand} ${model} (expected 120-700).` };
+  }
+
+  const screenInches = parseBoundedFloat(input.screenInches, 4.0, 15.0, 6.67);
+  if (screenInches === null) {
+    return { ok: false, error: `Invalid screenInches for ${brand} ${model} (expected 4.0-15.0).` };
+  }
+
+  const chipset =
+    typeof input.chipset === 'string' && input.chipset.trim()
+      ? input.chipset.trim().slice(0, 80)
+      : os === 'iOS'
+        ? 'Apple Silicon'
+        : 'Snapdragon / Dimensity';
+
+  const defaultDpi = parseBoundedInt(input.defaultDpi, 100, 600, os === 'iOS' ? 114 : 392);
+  const recommendedDpi = parseBoundedInt(input.recommendedDpi, 100, 650, os === 'iOS' ? 120 : 510);
+  if (defaultDpi === null || recommendedDpi === null) {
+    return { ok: false, error: `Invalid DPI values for ${brand} ${model}.` };
+  }
+
+  const thermalRaw = typeof input.thermalHeadroom === 'string' ? input.thermalHeadroom.trim() : '';
+  const thermalHeadroom: 'Tight' | 'Moderate' | 'High' = VALID_THERMAL.has(thermalRaw)
+    ? (thermalRaw as DeviceSpecRecord['thermalHeadroom'])
+    : ramGb <= 3
+      ? 'Tight'
+      : ramGb >= 8
+        ? 'High'
+        : 'Moderate';
+
+  let presetSensitivity: SensitivityValuesRecord | undefined;
+  if (input.presetSensitivity !== undefined && input.presetSensitivity !== null) {
+    if (typeof input.presetSensitivity !== 'object' || Array.isArray(input.presetSensitivity)) {
+      return { ok: false, error: `presetSensitivity must be an object for ${brand} ${model}.` };
+    }
+    const ps = input.presetSensitivity as Record<string, unknown>;
+    const general = parseBoundedInt(ps.general, 0, 200);
+    const redDot = parseBoundedInt(ps.redDot, 0, 200);
+    const scope2x = parseBoundedInt(ps.scope2x, 0, 200);
+    const scope4x = parseBoundedInt(ps.scope4x, 0, 200);
+    const sniperScope = parseBoundedInt(ps.sniperScope, 0, 200);
+    const freeLook = parseBoundedInt(ps.freeLook, 0, 200);
+    if (
+      general === null ||
+      redDot === null ||
+      scope2x === null ||
+      scope4x === null ||
+      sniperScope === null ||
+      freeLook === null
+    ) {
+      return {
+        ok: false,
+        error: `Sensitivity values for ${brand} ${model} must all be integers between 0 and 200.`,
+      };
+    }
+    presetSensitivity = { general, redDot, scope2x, scope4x, sniperScope, freeLook };
+  }
+
+  let presetFireButton: number | undefined;
+  if (input.presetFireButton !== undefined && input.presetFireButton !== null && input.presetFireButton !== '') {
+    const fb = parseBoundedInt(input.presetFireButton, 32, 70);
+    if (fb === null) {
+      return {
+        ok: false,
+        error: `Fire Button size for ${brand} ${model} must be between 32 and 70.`,
+      };
+    }
+    presetFireButton = fb;
+  }
+
+  return {
+    ok: true,
+    device: {
+      id,
+      brand,
+      model,
+      tier,
+      os,
+      ramGb,
+      refreshHz,
+      touchSamplingHz,
+      ppi,
+      screenInches,
+      chipset,
+      defaultDpi,
+      recommendedDpi,
+      thermalHeadroom,
+      ...(presetSensitivity ? { presetSensitivity } : {}),
+      ...(presetFireButton !== undefined ? { presetFireButton } : {}),
+    },
+  };
 }
 
 function hashPassword(password: string): string {
@@ -191,10 +444,30 @@ function isValidCustomId(value: string): boolean {
   return /^[a-zA-Z0-9._-]{3,32}$/.test(value);
 }
 
+function isValidEmail(value: string): boolean {
+  return value.length <= 120 && /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(value);
+}
+
+function deriveCustomIdFromEmail(email: string, store: AuthStoreData): string {
+  const local = email.split('@')[0] || 'player';
+  let base = local.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 24);
+  if (base.length < 3) base = `${base}_user`.slice(0, 24);
+  let candidate = base;
+  let suffix = 1;
+  while (
+    store.customers.some((c) => c.customId.toLowerCase() === candidate.toLowerCase()) ||
+    store.requests.some((r) => r.status === 'pending' && r.customId.toLowerCase() === candidate.toLowerCase())
+  ) {
+    candidate = `${base.slice(0, 20)}_${suffix++}`;
+  }
+  return candidate;
+}
+
 function sanitizeCustomer(c: CustomerRecord) {
   return {
     id: c.id,
     customId: c.customId,
+    email: c.email,
     displayName: c.displayName,
     assignedDeviceId: c.assignedDeviceId,
     active: c.active,
@@ -219,6 +492,7 @@ function sanitizeRequest(r: CustomerRequestRecord) {
   return {
     id: r.id,
     customId: r.customId,
+    email: r.email,
     displayName: r.displayName,
     requestedDeviceId: r.requestedDeviceId,
     note: r.note,
@@ -270,7 +544,7 @@ function setSessionCookie(req: Request, res: Response, token: string): void {
     'HttpOnly',
     `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
     secure ? 'SameSite=None' : 'SameSite=Lax',
-    ...(secure ? ['Secure'] : []),
+    ...(secure ? ['Secure', 'Partitioned'] : []),
   ];
   res.setHeader('Set-Cookie', attrs.join('; '));
 }
@@ -283,9 +557,28 @@ function clearSessionCookie(req: Request, res: Response): void {
     'HttpOnly',
     'Max-Age=0',
     secure ? 'SameSite=None' : 'SameSite=Lax',
-    ...(secure ? ['Secure'] : []),
+    ...(secure ? ['Secure', 'Partitioned'] : []),
   ];
   res.setHeader('Set-Cookie', attrs.join('; '));
+}
+
+function isSameOriginMutation(req: Request): boolean {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
+    return true;
+  }
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  const hostHeader =
+    (typeof req.headers['x-forwarded-host'] === 'string' && req.headers['x-forwarded-host'].split(',')[0].trim()) ||
+    req.headers.host ||
+    '';
+  if (!hostHeader) return false;
+  try {
+    const parsedOrigin = new URL(origin);
+    return parsedOrigin.host.toLowerCase() === hostHeader.toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
@@ -294,6 +587,10 @@ function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunctio
     ? header.slice('Bearer '.length).trim()
     : '';
   const cookieToken = parseCookieValue(req.headers.cookie, SESSION_COOKIE_NAME) || '';
+  if (!bearerToken && cookieToken && !isSameOriginMutation(req)) {
+    res.status(403).json({ error: 'Cross-origin request blocked' });
+    return;
+  }
   const token = bearerToken || cookieToken;
   if (!token) {
     res.status(401).json({ error: 'Authentication required' });
@@ -318,7 +615,7 @@ function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFuncti
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '100kb' }));
+  app.use(express.json({ limit: '500kb' }));
 
   // Auth status: checks if Admin credentials are configured (env, claimed, or named admins)
   app.get('/api/auth/status', (_req, res) => {
@@ -514,42 +811,46 @@ async function startServer() {
       return;
     }
 
-    // Customer login
+    // Customer login (supports Email ID or Customer ID)
+    const loginKey = customId.toLowerCase();
     const customer = store.customers.find(
-      (c) => c.customId.toLowerCase() === customId.toLowerCase()
+      (c) =>
+        c.customId.toLowerCase() === loginKey ||
+        (c.email && c.email.toLowerCase() === loginKey)
     );
     if (!customer) {
       const matchingReq = store.requests.find(
         (r) =>
-          r.customId.toLowerCase() === customId.toLowerCase() &&
+          (r.customId.toLowerCase() === loginKey ||
+            (r.email && r.email.toLowerCase() === loginKey)) &&
           verifyPasswordHash(password, r.passwordHash)
       );
       if (matchingReq?.status === 'pending') {
         res.status(403).json({
-          error: 'Your Customer ID request is pending Admin approval.',
+          error: 'Your login request is pending Admin approval.',
         });
         return;
       }
       if (matchingReq?.status === 'rejected') {
         res.status(403).json({
           error: matchingReq.rejectionReason
-            ? `Your Customer ID request was rejected: ${matchingReq.rejectionReason}`
-            : 'Your Customer ID request was rejected by the administrator.',
+            ? `Your login request was rejected: ${matchingReq.rejectionReason}`
+            : 'Your login request was rejected by the administrator.',
         });
         return;
       }
-      res.status(401).json({ error: 'Invalid Customer ID or password.' });
+      res.status(401).json({ error: 'Invalid Email / Customer ID or password.' });
       return;
     }
 
     if (!verifyPasswordHash(password, customer.passwordHash)) {
-      res.status(401).json({ error: 'Invalid Customer ID or password.' });
+      res.status(401).json({ error: 'Invalid Email / Customer ID or password.' });
       return;
     }
 
     if (!customer.active) {
       res.status(403).json({
-        error: 'This Customer ID has been suspended by an administrator.',
+        error: 'This user account has been suspended by an administrator.',
       });
       return;
     }
@@ -561,6 +862,7 @@ async function startServer() {
       sub: customer.id,
       role: 'customer',
       customId: customer.customId,
+      email: customer.email,
       displayName: customer.displayName,
       assignedDeviceId: customer.assignedDeviceId,
     });
@@ -572,30 +874,35 @@ async function startServer() {
         id: customer.id,
         role: 'customer',
         customId: customer.customId,
+        email: customer.email,
         displayName: customer.displayName,
         assignedDeviceId: customer.assignedDeviceId,
       },
     });
   });
 
-  // Public: Customer submits a request for a custom ID & password (pending Admin accept/reject)
+  // Public: User submits a request login with Mail ID (pending Admin accept/reject)
   app.post('/api/auth/request-access', (req, res) => {
-    const customId = typeof req.body?.customId === 'string' ? req.body.customId.trim() : '';
+    const emailRaw = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const customIdInput = typeof req.body?.customId === 'string' ? req.body.customId.trim() : '';
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
-    const displayName =
-      typeof req.body?.displayName === 'string' && req.body.displayName.trim()
-        ? req.body.displayName.trim().slice(0, 48)
-        : customId;
     const requestedDeviceId =
       typeof req.body?.requestedDeviceId === 'string' && req.body.requestedDeviceId.trim()
         ? req.body.requestedDeviceId.trim().slice(0, 64)
-        : 'moto-g54';
+        : 'samsung-a54';
     const note =
       typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 180) : '';
 
-    if (!isValidCustomId(customId)) {
+    if (!isValidEmail(emailRaw)) {
       res.status(400).json({
-        error: 'Customer ID must be 3-32 characters (letters, numbers, ., _, -).',
+        error: 'Please enter a valid Email ID (e.g. player@gmail.com).',
+      });
+      return;
+    }
+
+    if (customIdInput && !isValidCustomId(customIdInput)) {
+      res.status(400).json({
+        error: 'User ID must be 3-32 characters (letters, numbers, ., _, -).',
       });
       return;
     }
@@ -609,10 +916,35 @@ async function startServer() {
 
     const store = ensureStore();
     if (
+      store.customers.some((c) => c.email && c.email.toLowerCase() === emailRaw)
+    ) {
+      res.status(409).json({
+        error: 'This Email ID is already approved. Sign in on User Login.',
+      });
+      return;
+    }
+    if (
+      store.requests.some(
+        (r) => r.status === 'pending' && r.email && r.email.toLowerCase() === emailRaw
+      )
+    ) {
+      res.status(409).json({
+        error: 'A pending login request for this Email ID already exists.',
+      });
+      return;
+    }
+
+    const customId = customIdInput || deriveCustomIdFromEmail(emailRaw, store);
+    const displayName =
+      typeof req.body?.displayName === 'string' && req.body.displayName.trim()
+        ? req.body.displayName.trim().slice(0, 48)
+        : customId;
+
+    if (
       store.customers.some((c) => c.customId.toLowerCase() === customId.toLowerCase())
     ) {
       res.status(409).json({
-        error: 'This Customer ID is already registered. Choose a different ID.',
+        error: 'This User ID is already registered. Choose a different ID.',
       });
       return;
     }
@@ -624,7 +956,7 @@ async function startServer() {
       )
     ) {
       res.status(409).json({
-        error: 'A pending request for this Customer ID already exists.',
+        error: 'A pending request for this User ID already exists.',
       });
       return;
     }
@@ -632,6 +964,7 @@ async function startServer() {
     const record: CustomerRequestRecord = {
       id: `req-${crypto.randomUUID()}`,
       customId,
+      email: emailRaw,
       displayName,
       passwordHash: hashPassword(password),
       requestedDeviceId,
@@ -647,7 +980,7 @@ async function startServer() {
 
     res.status(201).json({
       request: sanitizeRequest(record),
-      message: 'Request submitted. An administrator will accept or reject your ID shortly.',
+      message: 'Request submitted. Once an Admin approves your Mail ID, you can sign in and access the app.',
     });
   });
 
@@ -658,6 +991,7 @@ async function startServer() {
       sub: u.sub,
       role: u.role,
       customId: u.customId,
+      email: u.email,
       displayName: u.displayName,
       assignedDeviceId: u.assignedDeviceId,
     });
@@ -668,6 +1002,7 @@ async function startServer() {
         id: u.sub,
         role: u.role,
         customId: u.customId,
+        email: u.email,
         displayName: u.displayName,
         assignedDeviceId: u.assignedDeviceId,
       },
@@ -709,6 +1044,7 @@ async function startServer() {
       sub: payload.sub,
       role: payload.role,
       customId: payload.customId,
+      email: payload.email,
       displayName: payload.displayName,
       assignedDeviceId: payload.assignedDeviceId,
     });
@@ -720,6 +1056,7 @@ async function startServer() {
         id: payload.sub,
         role: payload.role,
         customId: payload.customId,
+        email: payload.email,
         displayName: payload.displayName,
         assignedDeviceId: payload.assignedDeviceId,
       },
@@ -767,11 +1104,13 @@ async function startServer() {
       if (decision === 'accept') {
         if (
           store.customers.some(
-            (c) => c.customId.toLowerCase() === target.customId.toLowerCase()
+            (c) =>
+              c.customId.toLowerCase() === target.customId.toLowerCase() ||
+              (target.email && c.email && c.email.toLowerCase() === target.email.toLowerCase())
           )
         ) {
           res.status(409).json({
-            error: 'A customer with this Custom ID already exists.',
+            error: 'A user with this Email ID or Custom ID already exists.',
           });
           return;
         }
@@ -779,6 +1118,7 @@ async function startServer() {
         const newCustomer: CustomerRecord = {
           id: `cust-${crypto.randomUUID()}`,
           customId: target.customId,
+          email: target.email,
           displayName: target.displayName,
           passwordHash: target.passwordHash,
           assignedDeviceId: target.requestedDeviceId,
@@ -823,44 +1163,56 @@ async function startServer() {
     res.json({ customers: store.customers.map(sanitizeCustomer) });
   });
 
-  // Admin-only: Create Customer ID & Password
+  // Admin-only: Create Customer ID/Email & Password
   app.post('/api/admin/customers', requireAuth, requireAdmin, (req, res) => {
-    const customId = typeof req.body?.customId === 'string' ? req.body.customId.trim() : '';
+    const emailRaw = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const customIdInput = typeof req.body?.customId === 'string' ? req.body.customId.trim() : '';
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    const assignedDeviceId =
+      typeof req.body?.assignedDeviceId === 'string' && req.body.assignedDeviceId.trim()
+        ? req.body.assignedDeviceId.trim().slice(0, 64)
+        : 'samsung-a54';
+
+    if (emailRaw && !isValidEmail(emailRaw)) {
+      res.status(400).json({
+        error: 'Please enter a valid Email ID.',
+      });
+      return;
+    }
+
+    const store = ensureStore();
+    const customId = customIdInput || (emailRaw ? deriveCustomIdFromEmail(emailRaw, store) : '');
     const displayName =
       typeof req.body?.displayName === 'string' && req.body.displayName.trim()
         ? req.body.displayName.trim().slice(0, 48)
         : customId;
-    const assignedDeviceId =
-      typeof req.body?.assignedDeviceId === 'string' && req.body.assignedDeviceId.trim()
-        ? req.body.assignedDeviceId.trim().slice(0, 64)
-        : 'moto-g54';
 
     if (!isValidCustomId(customId)) {
       res.status(400).json({
-        error: 'Customer ID must be 3-32 characters (letters, numbers, ., _, -).',
+        error: 'User ID must be 3-32 characters (letters, numbers, ., _, -).',
       });
       return;
     }
 
     if (password.length < 4 || password.length > 128) {
       res.status(400).json({
-        error: 'Customer password must be between 4 and 128 characters.',
+        error: 'Password must be between 4 and 128 characters.',
       });
       return;
     }
 
-    const store = ensureStore();
     if (
-      store.customers.some((c) => c.customId.toLowerCase() === customId.toLowerCase())
+      store.customers.some((c) => c.customId.toLowerCase() === customId.toLowerCase()) ||
+      (emailRaw && store.customers.some((c) => c.email && c.email.toLowerCase() === emailRaw))
     ) {
-      res.status(409).json({ error: 'A customer with this Custom ID already exists.' });
+      res.status(409).json({ error: 'A user with this Email ID or Custom ID already exists.' });
       return;
     }
 
     const record: CustomerRecord = {
       id: `cust-${crypto.randomUUID()}`,
       customId,
+      email: emailRaw || undefined,
       displayName,
       passwordHash: hashPassword(password),
       assignedDeviceId,
@@ -1201,6 +1553,113 @@ async function startServer() {
       res.json({ reset: true });
     }
   );
+
+  // Public read: Master Device Catalog Overrides (edited / added / removed entries)
+  app.get('/api/catalog/overrides', (_req, res) => {
+    const overrides = readCatalogStore();
+    res.json(overrides);
+  });
+
+  // Admin-only: Add or Edit a single Device Sensitivity entry in Master Catalog
+  app.post('/api/admin/catalog/devices', requireAuth, requireAdmin, (req, res) => {
+    const rawDevice = req.body?.device ?? req.body;
+    const validated = sanitizeAndValidateDeviceSpec(rawDevice);
+    if (!validated.ok) {
+      res.status(400).json({ error: validated.error });
+      return;
+    }
+
+    const device = validated.device;
+    const catalog = readCatalogStore();
+    const existingIdx = catalog.upsertedDevices.findIndex((d) => d.id === device.id);
+    if (existingIdx >= 0) {
+      catalog.upsertedDevices[existingIdx] = device;
+    } else {
+      catalog.upsertedDevices.unshift(device);
+    }
+    catalog.removedIds = catalog.removedIds.filter((rid) => rid !== device.id);
+    saveCatalogStore(catalog);
+
+    res.status(existingIdx >= 0 ? 200 : 201).json({
+      device,
+      overrides: catalog,
+    });
+  });
+
+  // Admin-only: Bulk Add or Update Device Sensitivity entries in Master Catalog
+  app.post('/api/admin/catalog/bulk', requireAuth, requireAdmin, (req, res) => {
+    const items = Array.isArray(req.body?.devices) ? req.body.devices : null;
+    if (!items || items.length === 0) {
+      res.status(400).json({ error: 'Provide a non-empty array of devices to bulk import.' });
+      return;
+    }
+    if (items.length > 200) {
+      res.status(400).json({ error: 'Bulk import is limited to 200 devices per request.' });
+      return;
+    }
+
+    const validatedDevices: DeviceSpecRecord[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const check = sanitizeAndValidateDeviceSpec(items[i]);
+      if (!check.ok) {
+        res.status(400).json({ error: `Row ${i + 1}: ${check.error}` });
+        return;
+      }
+      validatedDevices.push(check.device);
+    }
+
+    const catalog = readCatalogStore();
+    const incomingIds = new Set(validatedDevices.map((d) => d.id));
+    catalog.removedIds = catalog.removedIds.filter((rid) => !incomingIds.has(rid));
+
+    for (const dev of validatedDevices) {
+      const idx = catalog.upsertedDevices.findIndex((d) => d.id === dev.id);
+      if (idx >= 0) {
+        catalog.upsertedDevices[idx] = dev;
+      } else {
+        catalog.upsertedDevices.unshift(dev);
+      }
+    }
+
+    saveCatalogStore(catalog);
+    res.status(201).json({
+      count: validatedDevices.length,
+      devices: validatedDevices,
+      overrides: catalog,
+    });
+  });
+
+  // Admin-only: Remove a device entry from Master Catalog (built-in or admin-added)
+  app.delete('/api/admin/catalog/devices/:id', requireAuth, requireAdmin, (req, res) => {
+    const rawId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+    if (!DEVICE_ID_REGEX.test(rawId)) {
+      res.status(400).json({ error: 'Invalid device ID.' });
+      return;
+    }
+
+    const catalog = readCatalogStore();
+    catalog.upsertedDevices = catalog.upsertedDevices.filter((d) => d.id !== rawId);
+    if (!catalog.removedIds.includes(rawId)) {
+      catalog.removedIds.push(rawId);
+    }
+    saveCatalogStore(catalog);
+
+    res.json({ removedId: rawId, overrides: catalog });
+  });
+
+  // Admin-only: Restore removed built-in devices or reset all catalog customizations
+  app.post('/api/admin/catalog/restore', requireAuth, requireAdmin, (req, res) => {
+    const mode = req.body?.mode === 'removed' ? 'removed' : 'all';
+    const catalog = readCatalogStore();
+    if (mode === 'removed') {
+      catalog.removedIds = [];
+    } else {
+      catalog.upsertedDevices = [];
+      catalog.removedIds = [];
+    }
+    saveCatalogStore(catalog);
+    res.json({ overrides: catalog });
+  });
 
   // Vite middleware in dev, static dist/ in production
   const isProd = process.env.NODE_ENV === 'production';

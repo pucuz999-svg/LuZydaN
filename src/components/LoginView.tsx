@@ -1,6 +1,14 @@
 import React, { useEffect, useState } from 'react';
-import { Eye, EyeOff, KeyRound, Send, ShieldCheck, UserCheck } from 'lucide-react';
-import { AuthStatus, AuthUser, DeviceSpec, UserRole } from '../types';
+import {
+  Eye,
+  EyeOff,
+  KeyRound,
+  Mail,
+  Send,
+  ShieldCheck,
+  UserCheck,
+} from 'lucide-react';
+import { AuthStatus, AuthUser, DeviceSpec } from '../types';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface LoginViewProps {
@@ -8,20 +16,22 @@ interface LoginViewProps {
   onLoginSuccess: (token: string, user: AuthUser) => void;
 }
 
+type AuthTabMode = 'user' | 'request' | 'admin';
+
 export const LoginView: React.FC<LoginViewProps> = ({
   devices,
   onLoginSuccess,
 }) => {
-  const [role, setRole] = useState<UserRole>('customer');
-  const [customerMode, setCustomerMode] = useState<'signin' | 'request'>('signin');
+  const [tab, setTab] = useState<AuthTabMode>('user');
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [statusLoading, setStatusLoading] = useState(true);
 
+  const [email, setEmail] = useState('');
   const [customId, setCustomId] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
-  const [requestedDeviceId, setRequestedDeviceId] = useState('moto-g54');
+  const [requestedDeviceId, setRequestedDeviceId] = useState('samsung-a54');
   const [requestNote, setRequestNote] = useState('');
   const [showPassword, setShowPassword] = useState(false);
 
@@ -56,16 +66,20 @@ export const LoginView: React.FC<LoginViewProps> = ({
   }, []);
 
   const isFirstRunAdminClaim =
-    role === 'admin' && authStatus !== null && !authStatus.adminConfigured;
+    tab === 'admin' && authStatus !== null && !authStatus.adminConfigured;
 
-  const isCustomerRequest = role === 'customer' && customerMode === 'request';
+  const isCustomerRequest = tab === 'request';
+  const role = tab === 'admin' ? 'admin' : 'customer';
 
-  const handleRoleSwitch = (nextRole: UserRole) => {
-    setRole(nextRole);
+  const handleTabSwitch = (nextTab: AuthTabMode) => {
+    setTab(nextTab);
     setError(null);
     setRequestSuccess(null);
     setPassword('');
     setConfirmPassword('');
+    if (nextTab === 'admin') {
+      setCustomId('');
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -73,9 +87,62 @@ export const LoginView: React.FC<LoginViewProps> = ({
     setError(null);
     setRequestSuccess(null);
 
+    if (isCustomerRequest) {
+      const trimmedEmail = email.trim().toLowerCase();
+      if (
+        !trimmedEmail ||
+        !/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(trimmedEmail)
+      ) {
+        setError('Please enter a valid Email ID (e.g. player@gmail.com).');
+        return;
+      }
+      if (password.length < 4) {
+        setError('Password must be at least 4 characters.');
+        return;
+      }
+
+      setSubmitting(true);
+      try {
+        const res = await fetch('/api/auth/request-access', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: trimmedEmail,
+            customId: customId.trim(),
+            displayName: displayName.trim() || customId.trim() || trimmedEmail.split('@')[0],
+            password,
+            requestedDeviceId,
+            note: requestNote.trim(),
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          setError(data?.error || 'Could not submit login request.');
+          return;
+        }
+        const assignedId = data?.request?.customId;
+        setRequestSuccess(
+          `Request submitted for ${trimmedEmail}${assignedId ? ` (User ID: ${assignedId})` : ''}. Once an Admin grants access, sign in with your Email ID and password.`
+        );
+        setCustomId(trimmedEmail);
+        setPassword('');
+        setRequestNote('');
+        setTab('user');
+      } catch {
+        setError('Network error while submitting login request.');
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
+
     const trimmedId = customId.trim();
     if (!trimmedId) {
-      setError(`Please enter your ${role === 'admin' ? 'Admin' : 'Customer'} ID.`);
+      setError(
+        tab === 'admin'
+          ? 'Please enter your Admin ID.'
+          : 'Please enter your Email ID or User ID.'
+      );
       return;
     }
     if (!password) {
@@ -108,43 +175,6 @@ export const LoginView: React.FC<LoginViewProps> = ({
         onLoginSuccess(data.token, data.user);
       } catch {
         setError('Network error while connecting to authentication server.');
-      } finally {
-        setSubmitting(false);
-      }
-      return;
-    }
-
-    if (isCustomerRequest) {
-      if (password.length < 4) {
-        setError('Password must be at least 4 characters.');
-        return;
-      }
-      setSubmitting(true);
-      try {
-        const res = await fetch('/api/auth/request-access', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            customId: trimmedId,
-            displayName: displayName.trim() || trimmedId,
-            password,
-            requestedDeviceId,
-            note: requestNote.trim(),
-          }),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          setError(data?.error || 'Could not submit request.');
-          return;
-        }
-        setRequestSuccess(
-          `Request submitted for "${trimmedId}". Wait for Admin approval, then sign in with your chosen ID and password.`
-        );
-        setPassword('');
-        setRequestNote('');
-        setCustomerMode('signin');
-      } catch {
-        setError('Network error while submitting request.');
       } finally {
         setSubmitting(false);
       }
@@ -189,63 +219,55 @@ export const LoginView: React.FC<LoginViewProps> = ({
 
         {/* Auth Card */}
         <div className="mt-8 rounded-xl border border-slate-800/90 bg-[#111622] p-6 sm:p-7">
-          {/* Role Segmented Switch */}
+          {/* 3-Mode Auth Switch: User Login | Request Login (Mail ID) | Admin Login */}
           <div
-            className="grid grid-cols-2 gap-1 rounded-lg bg-[#0B0E14] p-1 border border-slate-800"
+            className="grid grid-cols-3 gap-1 rounded-lg bg-[#0B0E14] p-1 border border-slate-800"
             role="tablist"
-            aria-label="Login role"
+            aria-label="Login mode"
           >
             <button
               type="button"
               role="tab"
-              aria-selected={role === 'customer'}
-              onClick={() => handleRoleSwitch('customer')}
-              className={`flex items-center justify-center gap-2 rounded-md py-2.5 text-xs font-semibold transition-colors whitespace-nowrap ${
-                role === 'customer'
+              aria-selected={tab === 'user'}
+              onClick={() => handleTabSwitch('user')}
+              className={`flex items-center justify-center gap-1.5 rounded-md py-2.5 px-2 text-xs font-semibold transition-colors whitespace-nowrap ${
+                tab === 'user'
                   ? 'bg-orange-500 text-slate-950'
                   : 'text-slate-400 hover:text-white'
               }`}
             >
-              <UserCheck className="h-3.5 w-3.5" />
-              Customer Login
+              <UserCheck className="h-3.5 w-3.5 shrink-0" />
+              User Login
             </button>
             <button
               type="button"
               role="tab"
-              aria-selected={role === 'admin'}
-              onClick={() => handleRoleSwitch('admin')}
-              className={`flex items-center justify-center gap-2 rounded-md py-2.5 text-xs font-semibold transition-colors whitespace-nowrap ${
-                role === 'admin'
+              aria-selected={tab === 'request'}
+              onClick={() => handleTabSwitch('request')}
+              className={`flex items-center justify-center gap-1.5 rounded-md py-2.5 px-2 text-xs font-semibold transition-colors whitespace-nowrap ${
+                tab === 'request'
                   ? 'bg-orange-500 text-slate-950'
                   : 'text-slate-400 hover:text-white'
               }`}
             >
-              <ShieldCheck className="h-3.5 w-3.5" />
+              <Mail className="h-3.5 w-3.5 shrink-0" />
+              Request Login
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === 'admin'}
+              onClick={() => handleTabSwitch('admin')}
+              className={`flex items-center justify-center gap-1.5 rounded-md py-2.5 px-2 text-xs font-semibold transition-colors whitespace-nowrap ${
+                tab === 'admin'
+                  ? 'bg-orange-500 text-slate-950'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
               Admin Login
             </button>
           </div>
-
-          {/* Customer Sub-mode Switch: Sign In vs Request ID */}
-          {role === 'customer' && (
-            <div className="mt-4 flex items-center justify-between border-b border-slate-800/80 pb-3 text-xs">
-              <span className="text-slate-400">
-                {customerMode === 'signin'
-                  ? 'Have an approved Customer ID?'
-                  : 'Request a new Customer ID'}
-              </span>
-              <button
-                type="button"
-                onClick={() => {
-                  setCustomerMode((m) => (m === 'signin' ? 'request' : 'signin'));
-                  setError(null);
-                  setRequestSuccess(null);
-                }}
-                className="font-semibold text-orange-400 hover:underline whitespace-nowrap"
-              >
-                {customerMode === 'signin' ? 'Request Access' : 'Back to Sign In'}
-              </button>
-            </div>
-          )}
 
           <div className="mt-5">
             {isFirstRunAdminClaim ? (
@@ -254,29 +276,29 @@ export const LoginView: React.FC<LoginViewProps> = ({
                   First-Run Admin Setup
                 </h2>
                 <p className="mt-1 text-xs leading-relaxed text-slate-400">
-                  No admin password is configured yet. Claim your Admin ID and password once to unlock customer management and request approvals.
+                  No admin password is configured yet. Claim your Admin ID and password once to review Mail ID login requests and grant app access.
                 </p>
               </div>
             ) : isCustomerRequest ? (
               <div>
                 <h2 className="text-base font-semibold text-white">
-                  Request Custom Customer ID
+                  Request Login Access with Mail ID
                 </h2>
                 <p className="mt-1 text-xs leading-relaxed text-slate-400">
-                  Choose your desired ID, password, and device. An administrator can accept or reject your request.
+                  Submit your Email ID, password, and phone model. An administrator will approve your request so you can access the app.
                 </p>
               </div>
             ) : (
               <div>
                 <h2 className="text-base font-semibold text-white">
-                  {role === 'admin' ? 'Administrator Sign In' : 'Customer Sign In'}
+                  {tab === 'admin' ? 'Administrator Sign In' : 'User Sign In'}
                 </h2>
                 <p className="mt-1 text-xs leading-relaxed text-slate-400">
-                  {role === 'admin'
-                    ? 'Sign in with your Admin ID and password to create customer credentials and approve requests.'
-                    : 'Enter your approved Customer ID and password to access your Free Fire calibration studio.'}
+                  {tab === 'admin'
+                    ? 'Sign in with your Admin ID and password to approve Mail ID requests and manage user access.'
+                    : 'Sign in with your approved Email ID (or User ID) and password to open the calibration studio.'}
                 </p>
-                {role === 'admin' && authStatus?.envOverrideActive && (
+                {tab === 'admin' && authStatus?.envOverrideActive && (
                   <p className="mt-2 rounded-lg border border-slate-800 bg-[#0B0E14] px-3 py-2 text-[11px] leading-relaxed text-slate-400">
                     Root admin secret (<span className="font-mono text-slate-200">ADMIN_ID</span> / <span className="font-mono text-slate-200">ADMIN_PASSCODE</span>) is active in Settings → Secrets. Created full-access Admin IDs can also sign in here.
                   </p>
@@ -304,47 +326,60 @@ export const LoginView: React.FC<LoginViewProps> = ({
           )}
 
           <form onSubmit={handleSubmit} className="mt-5 space-y-4">
-            <div>
-              <label
-                htmlFor="login-custom-id"
-                className="block text-xs font-medium text-slate-300"
-              >
-                {role === 'admin' ? 'Admin ID' : 'Customer ID'}
-              </label>
-              <input
-                id="login-custom-id"
-                type="text"
-                autoComplete="username"
-                value={customId}
-                onChange={(e) => setCustomId(e.target.value)}
-                placeholder={
-                  isFirstRunAdminClaim
-                    ? 'Choose admin ID (e.g. admin)'
-                    : role === 'admin'
-                      ? 'Enter Admin ID'
-                      : 'Enter Customer ID (e.g. player_01)'
-                }
-                className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3.5 py-2.5 text-sm font-mono text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
-              />
-            </div>
-
-            {isCustomerRequest && (
+            {isCustomerRequest ? (
               <>
                 <div>
                   <label
-                    htmlFor="req-display-name"
+                    htmlFor="req-email-id"
                     className="block text-xs font-medium text-slate-300"
                   >
-                    Player Name
+                    Email ID
                   </label>
                   <input
-                    id="req-display-name"
-                    type="text"
-                    value={displayName}
-                    onChange={(e) => setDisplayName(e.target.value)}
-                    placeholder="In-game name or nickname"
-                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3.5 py-2.5 text-sm text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
+                    id="req-email-id"
+                    type="email"
+                    autoComplete="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="player@gmail.com"
+                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3.5 py-2.5 text-sm font-mono text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
                   />
+                </div>
+
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <div>
+                    <label
+                      htmlFor="req-display-name"
+                      className="block text-xs font-medium text-slate-300"
+                    >
+                      Player Name
+                    </label>
+                    <input
+                      id="req-display-name"
+                      type="text"
+                      value={displayName}
+                      onChange={(e) => setDisplayName(e.target.value)}
+                      placeholder="In-game nickname"
+                      className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3.5 py-2.5 text-sm text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="login-custom-id"
+                      className="block text-xs font-medium text-slate-300"
+                    >
+                      User ID (Optional)
+                    </label>
+                    <input
+                      id="login-custom-id"
+                      type="text"
+                      value={customId}
+                      onChange={(e) => setCustomId(e.target.value)}
+                      placeholder="Auto from email"
+                      className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3.5 py-2.5 text-sm font-mono text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
+                    />
+                  </div>
                 </div>
 
                 <div>
@@ -368,6 +403,30 @@ export const LoginView: React.FC<LoginViewProps> = ({
                   </select>
                 </div>
               </>
+            ) : (
+              <div>
+                <label
+                  htmlFor="login-custom-id"
+                  className="block text-xs font-medium text-slate-300"
+                >
+                  {tab === 'admin' ? 'Admin ID' : 'Email ID or User ID'}
+                </label>
+                <input
+                  id="login-custom-id"
+                  type="text"
+                  autoComplete="username"
+                  value={customId}
+                  onChange={(e) => setCustomId(e.target.value)}
+                  placeholder={
+                    isFirstRunAdminClaim
+                      ? 'Choose admin ID (e.g. admin)'
+                      : tab === 'admin'
+                        ? 'Enter Admin ID'
+                        : 'player@gmail.com or user_id'
+                  }
+                  className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3.5 py-2.5 text-sm font-mono text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
+                />
+              </div>
             )}
 
             <div>
@@ -425,7 +484,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
                   type="text"
                   value={requestNote}
                   onChange={(e) => setRequestNote(e.target.value)}
-                  placeholder="e.g. Need Moto G54 one-tap setup"
+                  placeholder="e.g. Need Galaxy A54 one-tap setup"
                   className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#0B0E14] px-3.5 py-2.5 text-sm text-white placeholder-slate-500 focus:border-orange-500 focus:outline-none"
                 />
               </div>
@@ -466,24 +525,24 @@ export const LoginView: React.FC<LoginViewProps> = ({
                 : isFirstRunAdminClaim
                   ? 'Claim Admin Account & Sign In'
                   : isCustomerRequest
-                    ? 'Submit Customer ID Request'
-                    : role === 'admin'
+                    ? 'Submit Mail ID Request'
+                    : tab === 'admin'
                       ? 'Sign In as Admin'
-                      : 'Sign In as Customer'}
+                      : 'Sign In to App'}
             </button>
           </form>
 
-          {role === 'customer' && !statusLoading && authStatus && !authStatus.adminConfigured && (
+          {tab === 'user' && !statusLoading && authStatus && !authStatus.adminConfigured && (
             <p className="mt-4 border-t border-slate-800/80 pt-4 text-xs text-slate-400">
               Setting up for the first time? Switch to{' '}
               <button
                 type="button"
-                onClick={() => handleRoleSwitch('admin')}
+                onClick={() => handleTabSwitch('admin')}
                 className="font-semibold text-orange-400 hover:underline"
               >
                 Admin Login
               </button>{' '}
-              to claim your admin credentials and review requests.
+              to claim your admin credentials and approve requests.
             </p>
           )}
         </div>

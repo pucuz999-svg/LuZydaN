@@ -94,6 +94,7 @@ export interface AuthUser {
   id: string;
   role: UserRole;
   customId: string;
+  email?: string;
   displayName: string;
   assignedDeviceId?: string;
 }
@@ -101,6 +102,7 @@ export interface AuthUser {
 export interface CustomerAccount {
   id: string;
   customId: string;
+  email?: string;
   displayName: string;
   assignedDeviceId: string;
   active: boolean;
@@ -129,6 +131,7 @@ export type RequestStatus = 'pending' | 'accepted' | 'rejected';
 export interface CustomerRequest {
   id: string;
   customId: string;
+  email?: string;
   displayName: string;
   requestedDeviceId: string;
   note: string;
@@ -145,6 +148,11 @@ export interface NotificationBlockSettings {
   blockCalls: boolean;
   blockFloatingBubbles: boolean;
   muteInAppAlerts: boolean;
+}
+
+export interface CatalogOverrides {
+  upsertedDevices: DeviceSpec[];
+  removedIds: string[];
 }
 
 
